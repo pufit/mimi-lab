@@ -1,0 +1,15 @@
+{
+  "name": "migaku-tokenizer",
+  "private": true,
+  "type": "module",
+  "description": "Pure-Node port: run Migaku's bundled Kotlin/JS JA analyzer offline for exact tokenization/dictForm.",
+  "scripts": {
+    "health": "curl -s http://127.0.0.1:8788/health",
+    "ext": "node extpath.mjs"
+  },
+  "dependencies": {
+    "fake-indexeddb": "^6.2.5",
+    "pako": "^3.0.0",
+    "sql.js": "^1.14.1"
+  }
+}

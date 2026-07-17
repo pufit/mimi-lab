@@ -1,0 +1,138 @@
+@import "tailwindcss";
+
+/* Dark, poster-forward design system. Tailwind v4 CSS-first config. */
+@theme {
+  --color-bg: #08080c;
+  --color-bg-elevated: #0f0f16;
+  --color-surface: #14141d;
+  --color-surface-hover: #1b1b27;
+  --color-border: #23232f;
+  --color-border-strong: #30303f;
+
+  --color-fg: #f3f3f7;
+  --color-muted: #9a9aac;
+  --color-faint: #6b6b7d;
+
+  --color-brand: #8b5cf6;
+  --color-brand-bright: #a78bfa;
+  --color-brand-dim: #6d4ad4;
+
+  /* comprehension scale */
+  --color-comp-red: #f43f5e;
+  --color-comp-amber: #f59e0b;
+  --color-comp-lime: #84cc16;
+  --color-comp-green: #22c55e;
+
+  --font-sans: "Inter", "Hiragino Sans", "Hiragino Kaku Gothic ProN",
+    "Noto Sans JP", "Yu Gothic", "Meiryo", system-ui, -apple-system,
+    "Segoe UI", Roboto, sans-serif;
+  --font-jp: "Hiragino Sans", "Hiragino Kaku Gothic ProN", "Noto Sans JP",
+    "Yu Gothic", "Meiryo", "Inter", system-ui, sans-serif;
+
+  --radius: 0.75rem;
+}
+
+@layer base {
+  * {
+    border-color: var(--color-border);
+  }
+  html {
+    color-scheme: dark;
+    scrollbar-gutter: stable;
+  }
+  body {
+    margin: 0;
+    background-color: var(--color-bg);
+    color: var(--color-fg);
+    font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+  :focus-visible {
+    outline: 2px solid var(--color-brand);
+    outline-offset: 2px;
+  }
+}
+
+/* App-wide aurora backdrop */
+.app-aurora {
+  position: fixed;
+  inset: 0;
+  z-index: -10;
+  pointer-events: none;
+  background:
+    radial-gradient(900px 500px at 80% -10%, color-mix(in oklab, var(--color-brand) 18%, transparent), transparent 60%),
+    radial-gradient(700px 500px at 0% 0%, color-mix(in oklab, #3b82f6 12%, transparent), transparent 55%),
+    radial-gradient(600px 600px at 50% 120%, color-mix(in oklab, var(--color-brand) 10%, transparent), transparent 60%);
+}
+
+/* Custom scrollbars */
+::-webkit-scrollbar {
+  width: 11px;
+  height: 11px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--color-border-strong);
+  border-radius: 99px;
+  border: 3px solid var(--color-bg);
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--color-faint);
+}
+
+/* Furigana ruby in Moments */
+ruby {
+  ruby-align: center;
+}
+ruby rt {
+  font-size: 0.5em;
+  color: var(--color-brand-bright);
+  font-weight: 500;
+  user-select: none;
+}
+
+/* Skeleton shimmer */
+@keyframes shimmer {
+  100% {
+    transform: translateX(100%);
+  }
+}
+.skeleton {
+  position: relative;
+  overflow: hidden;
+  background: var(--color-surface);
+}
+.skeleton::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  transform: translateX(-100%);
+  background: linear-gradient(
+    90deg,
+    transparent,
+    color-mix(in oklab, var(--color-fg) 6%, transparent),
+    transparent
+  );
+  animation: shimmer 1.6s infinite;
+}
+
+@keyframes fade-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+.animate-fade-in {
+  animation: fade-in 0.35s ease both;
+}
+
+.text-balance {
+  text-wrap: balance;
+}

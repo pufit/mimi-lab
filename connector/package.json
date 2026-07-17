@@ -1,0 +1,21 @@
+{
+  "name": "mimi-lab-connector",
+  "version": "1.1.0",
+  "description": "Mimi Lab Connector — runs on the machine where you watch. Holds an external-CDP link to your dedicated Chrome+Migaku, dials out to the Lab server over a WebSocket, and on a one-click Play injects the server's media URL into Migaku's Player (Migaku fetches + plays + tokenizes).",
+  "type": "module",
+  "main": "index.mjs",
+  "bin": {
+    "mimi-lab-connector": "index.mjs"
+  },
+  "scripts": {
+    "start": "node index.mjs",
+    "selftest": "node selftest.mjs"
+  },
+  "license": "ISC",
+  "dependencies": {
+    "pako": "^2.2.0",
+    "playwright-core": "^1.61.1",
+    "sql.js": "^1.14.1",
+    "ws": "^8.18.0"
+  }
+}

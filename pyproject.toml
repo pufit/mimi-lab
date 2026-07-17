@@ -1,0 +1,40 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mimi-lab"
+version = "0.2.0"
+description = "Self-hosted platform for watching anime and learning Japanese, built around Migaku."
+requires-python = ">=3.13"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.34",
+    "httpx>=0.28",
+    "pydantic>=2.10",
+    "pydantic-settings>=2.7",
+    "python-dotenv>=1.0",
+    "python-multipart>=0.0.18",
+    "anitopy>=2.1",
+    "fugashi>=1.4",
+    "unidic-lite>=1.0.8",
+    "jaconv>=0.4",
+    "pysubs2>=1.7",
+    "apscheduler>=3.11",
+    # Acquisition speaks Transmission RPC (qBittorrent's macOS build can't run
+    # headless; the qbittorrent-api dep was vestigial and is dropped).
+    "transmission-rpc>=7.0",
+    "feedparser>=6.0",
+    "beautifulsoup4>=4.12",
+    "lxml>=5.3",
+    # Runtime dependencies declared explicitly for clean installs:
+    "webrtcvad-wheels>=2.0",   # VAD scoring for the self-verifying subtitle aligner
+    "chardet>=5.2",            # subtitle encoding detection
+    "genanki>=0.13",           # .apkg Anki deck export (Study queue / Moments)
+]
+
+[project.optional-dependencies]
+align = ["ffsubsync>=0.4.27"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["app"]

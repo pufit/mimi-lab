@@ -1,0 +1,45 @@
+# ── secrets & local config (NEVER commit) ──────────────────
+.env
+.env.*
+!.env.example
+
+# ── python ──
+.venv/
+**/__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+*.egg-info/
+
+# ── node / web build ──
+node_modules/
+web/dist/
+web/_shots/
+/harness/_shots/
+
+# ── runtime data (the DB holds MAL tokens; inbox/clips/transmission/logs are local) ──
+/data/
+/Library/
+*.log
+
+# ── built / downloaded datasets (regenerate via the scripts) ──
+#   glosses.sqlite        <- app/learn/data/build_data.py
+#   lemma_freq            <- tools/load_freq.py  (cache in app/learn/data/freq_cache/)
+#   anime-list-full.json  <- app/match.service.refresh_idmap()
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.db
+*.db-wal
+*.db-shm
+app/learn/data/freq_cache/
+app/learn/data/*.zip
+app/learn/data/*.json
+app/catalog/data/*.json
+harness/_dump/
+
+# ── macOS ──
+.DS_Store
+
+# ── internal design notes / investigations (not shipped) ──
+/notes/

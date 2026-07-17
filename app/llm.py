@@ -1,0 +1,168 @@
+"""Tiny Anthropic (Claude) helper — raw httpx, no SDK dependency.
+
+The project pins its venv (SPEC: no `pip install`), so rather than add the
+`anthropic` SDK we call the Messages API directly with httpx (the same client
+every other integration here uses). Used for *optional* smart matching (Claude
+Haiku ranks nyaa releases for an episode). Everything degrades gracefully: with
+no API key, a timeout, or any error this returns None and the caller falls back
+to its deterministic heuristic.
+"""
+from __future__ import annotations
+
+import json
+import logging
+import time
+from typing import Optional
+
+import httpx
+
+from .config import settings
+
+log = logging.getLogger("mimi_lab.llm")
+
+ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
+ANTHROPIC_VERSION = "2023-06-01"
+
+# transient statuses worth one retry (the old behavior fell straight back to
+# the heuristic on a blip 429/529)
+_RETRYABLE = {429, 500, 502, 503, 529}
+
+
+def available() -> bool:
+    """True if an Anthropic API key is configured."""
+    return bool(settings.anthropic_api_key)
+
+
+def _record_usage(model: str, usage: dict) -> None:
+    """Accumulate per-model token counters in kv — the system was previously
+    blind to its own LLM spend. Cheap (two kv upserts per call), surfaced via
+    usage_summary() on /api/health?full=1 and the System page."""
+    try:
+        from .db import cursor
+        in_tok = int(usage.get("input_tokens") or 0)
+        out_tok = int(usage.get("output_tokens") or 0)
+        with cursor() as cx:
+            for suffix, inc in (("in", in_tok), ("out", out_tok), ("calls", 1)):
+                cx.execute(
+                    "INSERT INTO kv(key, value) VALUES(?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET "
+                    "value = CAST(CAST(value AS INTEGER) + ? AS TEXT), "
+                    "updated_at = datetime('now')",
+                    (f"llm.usage.{model}.{suffix}", str(inc), inc),
+                )
+    except Exception as e:  # never let accounting break a call
+        log.debug("llm usage accounting failed: %s", e)
+
+
+def usage_summary() -> dict:
+    """Lifetime token counters per model, from kv."""
+    out: dict = {}
+    try:
+        from .db import connect
+        with connect() as cx:
+            for r in cx.execute("SELECT key, value FROM kv WHERE key LIKE 'llm.usage.%'"):
+                _, _, rest = r["key"].partition("llm.usage.")
+                model, _, suffix = rest.rpartition(".")
+                out.setdefault(model, {})[suffix] = int(r["value"] or 0)
+    except Exception:
+        pass
+    return out
+
+
+def claude_json(
+    system: str,
+    user: str,
+    *,
+    model: Optional[str] = None,
+    schema: Optional[dict] = None,
+    max_tokens: int = 512,
+    timeout: float = 20.0,
+) -> Optional[dict]:
+    """Call a Claude model and return a parsed JSON object, or None on any failure.
+
+    `model` defaults to `settings.anthropic_model` (Haiku). Pass e.g.
+    `settings.translation_model` (Sonnet) for heavier work like translation.
+
+    When `schema` (a JSON Schema) is given, the response is constrained to it via
+    `output_config.format` so the reply is guaranteed parseable. We omit the
+    `thinking`/`effort` params (Haiku doesn't support them). Never raises —
+    callers treat None as "LLM unavailable, fall back".
+    """
+    if not settings.anthropic_api_key:
+        return None
+
+    body: dict = {
+        "model": model or settings.anthropic_model,
+        "max_tokens": max_tokens,
+        "system": system,
+        "messages": [{"role": "user", "content": user}],
+    }
+    if schema is not None:
+        body["output_config"] = {"format": {"type": "json_schema", "schema": schema}}
+
+    headers = {
+        "x-api-key": settings.anthropic_api_key,
+        "anthropic-version": ANTHROPIC_VERSION,
+        "content-type": "application/json",
+    }
+
+    data = None
+    for attempt in (1, 2):
+        try:
+            r = httpx.post(ANTHROPIC_URL, json=body, headers=headers, timeout=timeout)
+            if r.status_code in _RETRYABLE and attempt == 1:
+                retry_after = min(10.0, float(r.headers.get("retry-after") or 2.0))
+                log.info("Claude %s — retrying once in %.1fs", r.status_code, retry_after)
+                time.sleep(retry_after)
+                continue
+            r.raise_for_status()
+            data = r.json()
+            break
+        except httpx.TimeoutException as e:
+            log.info("Claude call timed out (%s) — falling back", e)
+            return None
+        except Exception as e:  # network, auth, rate limit, etc. — degrade
+            log.info("Claude call failed (%s) — falling back", e)
+            return None
+    if data is None:
+        return None
+    _record_usage(body["model"], data.get("usage") or {})
+
+    # refusal / non-text stop — bail
+    if data.get("stop_reason") == "refusal":
+        log.info("Claude refused the request — falling back")
+        return None
+
+    text = ""
+    for block in data.get("content", []):
+        if block.get("type") == "text":
+            text += block.get("text", "")
+    text = text.strip()
+    if not text:
+        return None
+
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        # tolerate a fenced ```json block if the model added one
+        cleaned = text.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+        try:
+            return json.loads(cleaned)
+        except json.JSONDecodeError:
+            log.info("Claude returned non-JSON output — falling back")
+            return None
+
+
+def haiku_json(
+    system: str,
+    user: str,
+    *,
+    schema: Optional[dict] = None,
+    max_tokens: int = 512,
+    timeout: float = 20.0,
+) -> Optional[dict]:
+    """Backwards-compatible wrapper: `claude_json` on the default (Haiku) model."""
+    return claude_json(
+        system, user, model=settings.anthropic_model,
+        schema=schema, max_tokens=max_tokens, timeout=timeout,
+    )
