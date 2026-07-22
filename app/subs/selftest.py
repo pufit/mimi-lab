@@ -123,6 +123,77 @@ def _check_alignment_scoring() -> None:
         p.unlink(missing_ok=True)
 
 
+def _check_reference_hygiene() -> None:
+    """A typeset fansub track (karaoke frames, vector-drawing commands, per-glyph
+    credit animations) must reduce to its dialogue cues before it is scored
+    against or aligned to — otherwise onset agreement rewards piling JA cues
+    onto OP/ED storms (the Re:Zero S3E01 mangling, 2026-07-21)."""
+    import tempfile
+    import pysubs2
+    print("--- reference hygiene ---")
+    tmp = Path(tempfile.gettempdir())
+
+    ref = pysubs2.SSAFile()
+    dialogue = [(1000, "Hello there."), (5000, "Are you okay?"),
+                (60000, "Line three."), (65000, "Line four."), (70000, "Line five.")]
+    for t, txt in dialogue:
+        ref.append(pysubs2.SSAEvent(start=t, end=t + 2000, text=txt))
+    # rolling same-text re-emission (one dialogue line as 3 frames)
+    for i in range(3):
+        ref.append(pysubs2.SSAEvent(start=9000 + i * 100, end=9100 + i * 100, text="Rolling line."))
+    # karaoke frames: sub-300ms, growing text
+    for i in range(40):
+        ref.append(pysubs2.SSAEvent(start=20000 + i * 90, end=20090 + i * 90, text="mirai wo"[: 1 + i % 8]))
+    # vector-drawing typesetting
+    for i in range(30):
+        ref.append(pysubs2.SSAEvent(start=30000 + i * 40, end=30500 + i * 40, text="m 83.21 43.75 l 79 63.45 58.67"))
+    # per-glyph credit animation: healthy durations, single-char texts, huge density
+    for i in range(200):
+        ref.append(pysubs2.SSAEvent(start=40000 + (i % 4) * 250, end=40500 + (i % 4) * 250, text=str(i % 10)))
+    # multi-char storm: passes every per-cue filter, caught only by onset density
+    for i in range(120):
+        ref.append(pysubs2.SSAEvent(start=50000 + i * 30, end=50600 + i * 30, text=f"credit {i}"))
+    refp = tmp / "_mig_ref_typeset.srt"; ref.save(str(refp))
+
+    ev = S._dialogue_events(refp)
+    starts = sorted(s for s, _e, _t in ev)
+    dlg = [t for t, _ in dialogue]
+    check("hygiene keeps every dialogue cue",
+          all(any(abs(s - t) <= 1 for s in starts) for t in dlg), f"{starts}")
+    check("hygiene merges rolling same-text run to one cue",
+          sum(1 for s in starts if 8900 <= s <= 9300) == 1)
+    check("hygiene drops karaoke/drawing/glyph/density storms",
+          len(ev) <= len(dlg) + 1, f"{len(ev)} cues survive")
+
+    # a perfectly-timed JA sub must now outscore one shoved onto the storms
+    ja_ok = pysubs2.SSAFile()
+    for t, _ in dialogue:
+        ja_ok.append(pysubs2.SSAEvent(start=t + 150, end=t + 2000, text="日本語"))
+    okp = tmp / "_mig_ja_dlg.srt"; ja_ok.save(str(okp))
+    ja_storm = pysubs2.SSAFile()
+    for t in (20000, 30000, 40000, 50000, 52000):
+        ja_storm.append(pysubs2.SSAEvent(start=t, end=t + 2000, text="日本語"))
+    stormp = tmp / "_mig_ja_storm.srt"; ja_storm.save(str(stormp))
+    sc_ok = S._onset_agreement(okp, refp)
+    sc_storm = S._onset_agreement(stormp, refp)
+    check("hygiene: correct sub outscores storm-piled sub",
+          sc_ok is not None and sc_storm is not None and sc_ok > sc_storm,
+          f"{sc_ok} > {sc_storm}")
+
+    # too-few-dialogue reference is not trusted at all
+    tiny = pysubs2.SSAFile()
+    for i in range(10):
+        tiny.append(pysubs2.SSAEvent(start=1000 + i * 2000, end=2500 + i * 2000, text=f"line {i}"))
+    tinyp = tmp / "_mig_ref_tiny.srt"; tiny.save(str(tinyp))
+    check("hygiene: sparse track below anchor minimum",
+          len(S._dialogue_events(tinyp)) < S._REF_MIN_DIALOGUE_CUES)
+    check("hygiene: dialogue-ref writer refuses sparse track",
+          S._write_dialogue_ref(tinyp, tmp / "_mig_ref_tiny_out.srt") is None)
+
+    for p in (refp, okp, stormp, tinyp, tmp / "_mig_ref_tiny_out.srt"):
+        p.unlink(missing_ok=True)
+
+
 def _check_track_sanity() -> None:
     """The display-sanity gate must accept normal tracks (incl. occasional
     dual-speaker overlap) and reject a structurally-broken one — the same
@@ -206,6 +277,8 @@ def main() -> int:
     _check_caption_cleaner()
     print()
     _check_alignment_scoring()
+    print()
+    _check_reference_hygiene()
     print()
     _check_track_sanity()
     print()

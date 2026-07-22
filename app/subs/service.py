@@ -347,7 +347,8 @@ def _run_aligner(cmd: list[str], out_path: Path) -> bool:
 #
 #   * vs a trusted, video-timed reference subtitle (the embedded English —
 #     muxed into the release, frame-accurate by construction): fraction of the
-#     reference's cue-onsets that have a JA cue-onset within TOL. Timestamps
+#     reference's *dialogue* cue-onsets (hygiene-filtered — see the reference
+#     hygiene block below) that have a JA cue-onset within TOL. Timestamps
 #     only (cheap) and highly discriminative (empirically ~0.38 broken → ~0.70
 #     aligned for anime).
 #   * else vs the video's own speech (webrtcvad): fraction of JA cue time that
@@ -371,11 +372,98 @@ def _cue_starts(path: Path) -> list[int]:
         return []
 
 
+# --- Reference hygiene ------------------------------------------------------
+#
+# Embedded "English" tracks are often typeset fansub scripts (ASS flattened to
+# SRT): the dialogue is buried under karaoke frames (rolling sub-200ms cues,
+# syllable by syllable) and vector-drawing commands ("m 12 34 l ..."), which
+# concentrate in OP/ED storms where a dialogue sub correctly shows *nothing*.
+# Used raw, such a track poisons everything downstream: onset agreement becomes
+# ANTI-correlated with correctness — a perfectly-timed JA sub scores ~0.05
+# (>90% of ref onsets are karaoke frames with no dialogue counterpart) while a
+# sub shoved onto an OP/ED storm scores ~0.30 — so aligners "win" by piling
+# dialogue cues onto karaoke clusters. (Re:Zero S3E01, 2026-07-21: a correct
+# jimaku sub was progressively mangled across re-align passes while the score
+# "improved" 0.30 -> 0.57.)
+#
+# Therefore every consumer of a reference — the onset scorer, alass-en, and the
+# trust gate — sees only its *dialogue-like* cues: drawing commands and
+# single-character glyphs dropped, rolling same-text runs merged,
+# sub-_REF_MIN_CUE_MS leftovers dropped, and onset *storms* removed (typeset
+# credit animations emit hundreds of cues per second — e.g. one cue per falling
+# glyph, each a healthy 500ms long, so only density gives them away; dialogue
+# never exceeds a few onsets per second). A reference reduced below
+# _REF_MIN_DIALOGUE_CUES cannot anchor an episode and is not trusted at all
+# (align_episode then waits, as with no reference).
+
+_REF_MIN_CUE_MS = 300          # real dialogue cues are ≥300ms; karaoke frames ~40-100ms
+_REF_MIN_DIALOGUE_CUES = 50    # fewer can't anchor a whole episode
+_REF_MERGE_GAP_MS = 500        # same-text cues this close = one rolling emission
+_REF_STORM_ONSETS_PER_S = 6    # more onsets in one second = typesetting, not speech
+_DRAWING_RE = re.compile(
+    r"^(?:\{[^}]*\}\s*)*m\s+-?\d+(?:\.\d+)?\s+-?\d+(?:\.\d+)?\s+[lbms]", re.IGNORECASE)
+
+
+def _dialogue_events(path: Path) -> list[tuple[int, int, str]]:
+    """(start_ms, end_ms, text) of a track's dialogue-like cues — see the
+    reference-hygiene block above. Empty list when unparsable."""
+    try:
+        subs = _load_subs(path)
+    except Exception:
+        return []
+    ev: list[list] = []
+    for e in subs:
+        if e.is_comment:
+            continue
+        text = (e.text or "").strip()
+        if not text or len(text) < 2 or _DRAWING_RE.match(text):
+            continue
+        ev.append([int(e.start), int(e.end), text])
+    ev.sort()
+    merged: list[list] = []
+    for s, en, t in ev:
+        if merged and merged[-1][2] == t and s - merged[-1][1] <= _REF_MERGE_GAP_MS:
+            merged[-1][1] = max(merged[-1][1], en)  # rolling re-emission of the same line
+        else:
+            merged.append([s, en, t])
+    kept = [(s, en, t) for s, en, t in merged if en - s >= _REF_MIN_CUE_MS]
+    # onset-storm removal: drop every cue starting in a second whose onset count
+    # is impossible for dialogue (typeset OP/ED animations, per-glyph credits).
+    per_s: dict[int, int] = {}
+    for s, _en, _t in kept:
+        per_s[s // 1000] = per_s.get(s // 1000, 0) + 1
+    return [(s, en, t) for s, en, t in kept
+            if per_s[s // 1000] <= _REF_STORM_ONSETS_PER_S]
+
+
+def _dialogue_starts(path: Path) -> list[int]:
+    return sorted(s for s, _e, _t in _dialogue_events(path))
+
+
+def _write_dialogue_ref(ref: Path, dest: Path) -> Optional[Path]:
+    """Write the dialogue-only view of `ref` to `dest` (SRT) for use as an
+    aligner reference. None when filtering leaves too little to anchor on or
+    the write fails — callers then fall back to the raw reference."""
+    ev = _dialogue_events(ref)
+    if len(ev) < _REF_MIN_DIALOGUE_CUES:
+        return None
+    try:
+        out = pysubs2.SSAFile()
+        out.events = [pysubs2.SSAEvent(start=s, end=e, text=t) for s, e, t in ev]
+        out.save(str(dest), format_="srt")
+        return dest
+    except Exception as e:
+        log.info("align: could not write dialogue reference (%s)", e)
+        return None
+
+
 def _onset_agreement(ja_path: Path, ref_path: Path, tol_ms: int = _ONSET_TOL_MS) -> Optional[float]:
-    """Fraction of reference cue-onsets that have a JA cue-onset within tol_ms.
-    High => JA cues start when the dialogue starts (per the trusted reference)."""
+    """Fraction of the reference's *dialogue* cue-onsets that have a JA cue-onset
+    within tol_ms. High => JA cues start when the dialogue starts (per the
+    trusted reference). The reference side is hygiene-filtered (block above) so
+    karaoke/typesetting storms can't dominate the denominator."""
     import bisect
-    ref = _cue_starts(ref_path)
+    ref = _dialogue_starts(ref_path)
     ja = _cue_starts(ja_path)
     if not ref or not ja:
         return None
@@ -523,8 +611,13 @@ def align(sub_path: str | Path, video_path: str | Path,
 
     # ---- VERIFIED: pick the best cue-onset agreement with the trusted reference
     if ref:
+        # alass anchors on the reference's cue structure — feed it the dialogue-
+        # only view (reference hygiene above) so OP/ED karaoke storms can't
+        # attract splits. Scoring uses the same view via _onset_agreement.
+        ref_clean = _write_dialogue_ref(
+            ref, sub_path.with_name(sub_path.stem + ".refdialogue.srt")) or ref
         attempts: list[tuple[str, "callable"]] = [
-            ("alass-en", lambda out: alass + [str(ref), str(sub_path), str(out), "--split-penalty", "7"])
+            ("alass-en", lambda out: alass + [str(ref_clean), str(sub_path), str(out), "--split-penalty", "7"])
         ] if alass else []
         if have_video and alass:
             attempts.append(("alass", lambda out: alass + [
@@ -553,6 +646,11 @@ def align(sub_path: str | Path, video_path: str | Path,
             for t in tmps:
                 try:
                     t.unlink(missing_ok=True)
+                except Exception:
+                    pass
+            if ref_clean != ref:
+                try:
+                    ref_clean.unlink(missing_ok=True)
                 except Exception:
                     pass
         return False, None, best_score, "en"
@@ -1167,6 +1265,14 @@ def _reference_sub_for(ep: dict) -> Optional[Path]:
     if not ok:
         log.info("align: EN reference for ep %s untrusted (%s) — ignoring",
                  ep.get("id"), why)
+        return None
+    # A track that is nearly all typesetting/karaoke (reference hygiene block)
+    # has too few dialogue-like cues left to anchor an episode — not a usable
+    # ground truth, even though it displays fine.
+    n_dialogue = len(_dialogue_events(en))
+    if n_dialogue < _REF_MIN_DIALOGUE_CUES:
+        log.info("align: EN reference for ep %s untrusted (only %d dialogue-like "
+                 "cues after hygiene filtering) — ignoring", ep.get("id"), n_dialogue)
         return None
     return en
 
