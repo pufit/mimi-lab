@@ -399,41 +399,83 @@ def _cue_starts(path: Path) -> list[int]:
 _REF_MIN_CUE_MS = 300          # real dialogue cues are ≥300ms; karaoke frames ~40-100ms
 _REF_MIN_DIALOGUE_CUES = 50    # fewer can't anchor a whole episode
 _REF_MERGE_GAP_MS = 500        # same-text cues this close = one rolling emission
+_REF_MAX_ROLL_FRAGMENTS = 3    # dialogue re-emits ≤3×; karaoke lines roll as dozens of frames
 _REF_STORM_ONSETS_PER_S = 6    # more onsets in one second = typesetting, not speech
+_REF_JUNK_ZONE_PER_S = 10      # ≥ this many *dropped* cues in a second = typeset zone
+_REF_JUNK_ZONE_PAD_S = 2       # zone influence extends this far around the hot second
 _DRAWING_RE = re.compile(
     r"^(?:\{[^}]*\}\s*)*m\s+-?\d+(?:\.\d+)?\s+-?\d+(?:\.\d+)?\s+[lbms]", re.IGNORECASE)
 
 
 def _dialogue_events(path: Path) -> list[tuple[int, int, str]]:
     """(start_ms, end_ms, text) of a track's dialogue-like cues — see the
-    reference-hygiene block above. Empty list when unparsable."""
+    reference-hygiene block above. Empty list when unparsable.
+
+    Beyond the per-cue filters, two structural passes matter:
+      * rolling-fragment cap — a lyric line rolled out as dozens of sub-100ms
+        frames merges back into one healthy-looking cue, but the fragment count
+        survives the merge and gives it away;
+      * junk-zone exclusion — OP/ED karaoke blocks emit song-line *translations*
+        (romaji + English) that pass every per-cue test, yet they always sit
+        inside a region saturated with cues the other filters dropped (drawing
+        frames, glyph storms). Seconds dense in dropped junk mark typeset
+        zones; survivors starting there are lyrics, not dialogue. Without this,
+        a cut difference around an OP gets "corrected" by alass onto the lyric
+        anchors — dialogue rolling during the opening (Re:Zero S3E02).
+    """
     try:
         subs = _load_subs(path)
     except Exception:
         return []
+    junk_per_s: dict[int, int] = {}
+
+    def _junk(start_ms: int, weight: int = 1) -> None:
+        junk_per_s[start_ms // 1000] = junk_per_s.get(start_ms // 1000, 0) + weight
+
     ev: list[list] = []
     for e in subs:
         if e.is_comment:
             continue
         text = (e.text or "").strip()
-        if not text or len(text) < 2 or _DRAWING_RE.match(text):
+        if not text:
+            continue
+        if len(text) < 2 or _DRAWING_RE.match(text):
+            _junk(int(e.start))
             continue
         ev.append([int(e.start), int(e.end), text])
     ev.sort()
-    merged: list[list] = []
+    merged: list[list] = []  # [start, end, text, fragments]
     for s, en, t in ev:
         if merged and merged[-1][2] == t and s - merged[-1][1] <= _REF_MERGE_GAP_MS:
             merged[-1][1] = max(merged[-1][1], en)  # rolling re-emission of the same line
+            merged[-1][3] += 1
         else:
-            merged.append([s, en, t])
-    kept = [(s, en, t) for s, en, t in merged if en - s >= _REF_MIN_CUE_MS]
+            merged.append([s, en, t, 1])
+    kept: list[tuple[int, int, str]] = []
+    for s, en, t, n in merged:
+        if en - s >= _REF_MIN_CUE_MS and n <= _REF_MAX_ROLL_FRAGMENTS:
+            kept.append((s, en, t))
+        else:
+            _junk(s, n)
     # onset-storm removal: drop every cue starting in a second whose onset count
     # is impossible for dialogue (typeset OP/ED animations, per-glyph credits).
     per_s: dict[int, int] = {}
     for s, _en, _t in kept:
         per_s[s // 1000] = per_s.get(s // 1000, 0) + 1
-    return [(s, en, t) for s, en, t in kept
-            if per_s[s // 1000] <= _REF_STORM_ONSETS_PER_S]
+    survivors: list[tuple[int, int, str]] = []
+    for s, en, t in kept:
+        if per_s[s // 1000] <= _REF_STORM_ONSETS_PER_S:
+            survivors.append((s, en, t))
+        else:
+            _junk(s)
+    # junk-zone exclusion (see docstring): survivors starting near a second
+    # saturated with dropped cues are song lines inside a typeset block.
+    hot = {sec for sec, n in junk_per_s.items() if n >= _REF_JUNK_ZONE_PER_S}
+    if not hot:
+        return survivors
+    return [(s, en, t) for s, en, t in survivors
+            if not any((s // 1000 + d) in hot
+                       for d in range(-_REF_JUNK_ZONE_PAD_S, _REF_JUNK_ZONE_PAD_S + 1))]
 
 
 def _dialogue_starts(path: Path) -> list[int]:

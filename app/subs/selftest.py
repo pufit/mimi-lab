@@ -135,7 +135,8 @@ def _check_reference_hygiene() -> None:
 
     ref = pysubs2.SSAFile()
     dialogue = [(1000, "Hello there."), (5000, "Are you okay?"),
-                (60000, "Line three."), (65000, "Line four."), (70000, "Line five.")]
+                (60000, "Line three."), (65000, "Line four."), (70000, "Line five."),
+                (96500, "Zone-adjacent line.")]
     for t, txt in dialogue:
         ref.append(pysubs2.SSAEvent(start=t, end=t + 2000, text=txt))
     # rolling same-text re-emission (one dialogue line as 3 frames)
@@ -153,15 +154,29 @@ def _check_reference_hygiene() -> None:
     # multi-char storm: passes every per-cue filter, caught only by onset density
     for i in range(120):
         ref.append(pysubs2.SSAEvent(start=50000 + i * 30, end=50600 + i * 30, text=f"credit {i}"))
+    # lyric line rolled as many frames: merges into a healthy-looking 2s cue,
+    # only the fragment count gives it away
+    for i in range(20):
+        ref.append(pysubs2.SSAEvent(start=80000 + i * 100, end=80100 + i * 100, text="lyric line rolling out."))
+    # OP-style typeset zone: song translations (healthy per-cue shape) inside a
+    # region saturated with drawing frames — only the junk zone catches them
+    for i in range(36):
+        ref.append(pysubs2.SSAEvent(start=90000 + i * 80, end=90080 + i * 80, text="m 14.87 18.48 l 31.56 19.2 34.5"))
+    ref.append(pysubs2.SSAEvent(start=90500, end=92000, text="kotoba ga hito wo yuitsukeru you ni"))
+    ref.append(pysubs2.SSAEvent(start=92100, end=93600, text="As their words tie people to each other,"))
     refp = tmp / "_mig_ref_typeset.srt"; ref.save(str(refp))
 
     ev = S._dialogue_events(refp)
     starts = sorted(s for s, _e, _t in ev)
     dlg = [t for t, _ in dialogue]
-    check("hygiene keeps every dialogue cue",
+    check("hygiene keeps every dialogue cue (incl. zone-adjacent)",
           all(any(abs(s - t) <= 1 for s in starts) for t in dlg), f"{starts}")
     check("hygiene merges rolling same-text run to one cue",
           sum(1 for s in starts if 8900 <= s <= 9300) == 1)
+    check("hygiene drops many-fragment rolled lyric line",
+          not any(79000 <= s <= 83000 for s in starts))
+    check("hygiene drops song translations inside a typeset junk zone",
+          not any(89000 <= s <= 94000 for s in starts))
     check("hygiene drops karaoke/drawing/glyph/density storms",
           len(ev) <= len(dlg) + 1, f"{len(ev)} cues survive")
 
