@@ -353,6 +353,47 @@ def anilist_media_by_id(anilist_id: int) -> Optional[dict]:
     return None
 
 
+def anilist_media_by_ids(ids: list[int], *, max_retries: int = 4) -> list[dict]:
+    """Fetch many Media by AniList id (flattened), batched 50 per request (the
+    AniList page cap) — one query enriches a whole MAL pull instead of one
+    request per title. Best-effort: a chunk that keeps failing is skipped;
+    polite about 429 like the other AniList calls."""
+    q = """
+    query ($ids: [Int]) {
+      Page(page: 1, perPage: 50) {
+        media(id_in: $ids, type: ANIME) {
+          id idMal title { romaji english native }
+          episodes format seasonYear coverImage { large } bannerImage description
+        }
+      }
+    }
+    """.strip()
+    uniq = sorted({int(i) for i in ids if i is not None})
+    out: list[dict] = []
+    for i in range(0, len(uniq), 50):
+        chunk = uniq[i:i + 50]
+        backoff = 1.0
+        for attempt in range(max_retries):
+            try:
+                with httpx.Client(timeout=30) as c:
+                    r = c.post(ANILIST_URL, json={"query": q, "variables": {"ids": chunk}})
+                if r.status_code == 429:
+                    time.sleep(float(r.headers.get("Retry-After", backoff)))
+                    backoff = min(backoff * 2, 30)
+                    continue
+                r.raise_for_status()
+                media = (r.json().get("data") or {}).get("Page", {}).get("media") or []
+                out.extend(_flatten_media(m) for m in media)
+                break
+            except Exception as e:
+                log.warning("AniList media-by-ids error (%d ids): %s", len(chunk), e)
+                if attempt == max_retries - 1:
+                    break
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 30)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # 5. Fribb ID map
 # ---------------------------------------------------------------------------

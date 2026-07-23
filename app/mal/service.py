@@ -387,8 +387,9 @@ def pull() -> dict:
 
     Uses the Fribb idmap (lazy `app.match.service`) to resolve anilist ids and
     `app.catalog.service.upsert_title` to create the title row if missing, then
-    writes mal_status/mal_score/mal_progress/mal_updated_at directly. Returns
-    {count, mapped, unmapped}.
+    writes mal_status/mal_score/mal_progress/mal_updated_at directly. Stub rows
+    (no cover/romaji yet) are then enriched from AniList in one batched query.
+    Returns {count, mapped, unmapped, enriched}.
     """
     nodes = get_list()
     count = len(nodes)
@@ -396,7 +397,7 @@ def pull() -> dict:
     unmapped = 0
 
     if not nodes:
-        return {"count": 0, "mapped": 0, "unmapped": 0}
+        return {"count": 0, "mapped": 0, "unmapped": 0, "enriched": 0}
 
     # lazy imports: avoid import cycles + let the module load even if siblings
     # are mid-build.
@@ -440,9 +441,36 @@ def pull() -> dict:
         _write_mal_fields(int(anilist_id), int(mal_id), ls)
         mapped += 1
 
+    # Titles first seen via this pull exist only as stubs (ids + the MAL title
+    # string) — no cover/romaji/format, so the grid renders a blank card.
+    # Backfill every stub from AniList in one batched query. Scans the whole
+    # table (not just this pull) so previously-stubbed rows self-heal too.
+    enriched = 0
+    if mapped and catalog_service is not None and match_service is not None:
+        try:
+            with cursor() as cx:
+                stub_ids = [
+                    r["anilist_id"] for r in cx.execute(
+                        "SELECT anilist_id FROM titles "
+                        "WHERE cover_url IS NULL OR cover_url='' "
+                        "   OR romaji IS NULL OR romaji=''"
+                    ).fetchall()
+                ]
+            if stub_ids:
+                for media in match_service.anilist_media_by_ids(stub_ids):
+                    try:
+                        catalog_service.upsert_title(media)
+                        enriched += 1
+                    except Exception as e:
+                        log.debug("enrich upsert_title(%s) skipped: %s", media.get("id"), e)
+                log.info("pull: enriched %d/%d stub title(s) from AniList",
+                         enriched, len(stub_ids))
+        except Exception as e:
+            log.warning("pull: stub enrichment failed: %s", e)
+
     kv_set(KV_LAST_SYNC, str(int(time.time())))
     log.info("pull: %d nodes, %d mapped, %d unmapped", count, mapped, unmapped)
-    return {"count": count, "mapped": mapped, "unmapped": unmapped}
+    return {"count": count, "mapped": mapped, "unmapped": unmapped, "enriched": enriched}
 
 
 def _write_mal_fields(anilist_id: int, mal_id: int, list_status: dict) -> None:

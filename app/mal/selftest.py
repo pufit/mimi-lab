@@ -120,7 +120,8 @@ def test_not_authed_degrades() -> None:
 
     try:
         r = service.pull()
-        _ok("pull() degrades", r == {"count": 0, "mapped": 0, "unmapped": 0}, f"{r}")
+        _ok("pull() degrades",
+            r == {"count": 0, "mapped": 0, "unmapped": 0, "enriched": 0}, f"{r}")
     except Exception as e:
         _ok("pull() does not raise", False, f"raised {e!r}")
 
