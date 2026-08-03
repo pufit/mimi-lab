@@ -9,6 +9,7 @@ import {
   Languages,
   Scissors,
   Download,
+  ExternalLink,
   Package,
   ChevronDown,
   ListOrdered,
@@ -31,6 +32,7 @@ import { EmptyState } from "@/components/ui/empty-state";
 import { ErrorState } from "@/components/ui/error-state";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Furigana } from "@/components/furigana";
+import { MomentPlayer } from "@/components/moment-player";
 import { toast } from "@/components/ui/toast";
 import { cn, formatMs } from "@/lib/utils";
 import type { Moment, MomentSort, ClipResult } from "@/lib/types";
@@ -53,6 +55,7 @@ export function MomentsPage() {
   const [query, setQuery] = useState(() => (searchParams.get("q") ?? "").trim());
   const [sort, setSort] = useState<MomentSort>("position");
   const [show, setShow] = useState<{ id: number; title: string } | null>(null);
+  const [playing, setPlaying] = useState<Moment | null>(null);
 
   // debounce input → query
   useEffect(() => {
@@ -120,7 +123,7 @@ export function MomentsPage() {
     <div className="animate-fade-in">
       <PageHeader
         title="Moments"
-        subtitle="Every line in your library that uses a word — your personal immersion bank."
+        subtitle="Every line from your downloaded episodes that uses a word — click a moment to play that sentence."
       />
 
       {/* search */}
@@ -202,8 +205,8 @@ export function MomentsPage() {
       {!query && (
         <EmptyState
           icon={Sparkles}
-          title="Search your library"
-          description="Look up any Japanese word to find every sentence where it appears — with screenshot, audio, translation, and one-click jump back into Migaku."
+          title="Search your downloaded library"
+          description="Look up any Japanese word to find every sentence where it appears in content you've downloaded — click a result to watch that exact line, clip it, or jump back into Migaku."
         />
       )}
 
@@ -217,8 +220,8 @@ export function MomentsPage() {
           title="No moments found"
           description={
             <>
-              Nothing in your library uses <span className="font-jp text-fg">{query}</span>
-              {show ? ` in ${show.title}` : ""} yet. Ingest more subtitles, or try the
+              Nothing you&apos;ve downloaded uses <span className="font-jp text-fg">{query}</span>
+              {show ? ` in ${show.title}` : ""} yet. Download more episodes, or try the
               dictionary form of the word.
             </>
           }
@@ -251,7 +254,12 @@ export function MomentsPage() {
 
           <div className="grid gap-4 lg:grid-cols-2">
             {moments.map((m) => (
-              <MomentCard key={m.line_id} moment={m} showIplus1={sort === "iplus1"} />
+              <MomentCard
+                key={m.line_id}
+                moment={m}
+                showIplus1={sort === "iplus1"}
+                onOpen={() => setPlaying(m)}
+              />
             ))}
           </div>
 
@@ -268,11 +276,21 @@ export function MomentsPage() {
           )}
         </>
       )}
+
+      {playing && <MomentPlayer moment={playing} onClose={() => setPlaying(null)} />}
     </div>
   );
 }
 
-function MomentCard({ moment, showIplus1 }: { moment: Moment; showIplus1: boolean }) {
+function MomentCard({
+  moment,
+  showIplus1,
+  onOpen,
+}: {
+  moment: Moment;
+  showIplus1: boolean;
+  onOpen: () => void;
+}) {
   const play = usePlayMoment();
   const clip = useClip();
   const anki = useAnkiExport();
@@ -311,16 +329,64 @@ function MomentCard({ moment, showIplus1 }: { moment: Moment; showIplus1: boolea
     };
   }, []);
 
+  // The whole card plays the sentence; inner controls stopPropagation.
+  const openFromCard = () => {
+    // don't hijack a text-selection drag (people copy sentences)
+    if (window.getSelection()?.toString()) return;
+    onOpen();
+  };
+
   return (
-    <article className="group flex gap-4 overflow-hidden rounded-2xl border border-border bg-surface/60 p-4 transition-colors hover:border-border-strong">
+    <article
+      role={hasVideo ? "button" : undefined}
+      tabIndex={hasVideo ? 0 : undefined}
+      onClick={hasVideo ? openFromCard : undefined}
+      onKeyDown={
+        hasVideo
+          ? (e) => {
+              if ((e.key === "Enter" || e.key === " ") && e.target === e.currentTarget) {
+                e.preventDefault();
+                onOpen();
+              }
+            }
+          : undefined
+      }
+      aria-label={hasVideo ? "Play this sentence" : undefined}
+      className={cn(
+        "group relative flex gap-4 overflow-hidden rounded-2xl border border-border bg-surface/60 p-4 transition-colors hover:border-border-strong",
+        hasVideo &&
+          "cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand",
+      )}
+    >
+      {/* hover affordance for cards without a thumbnail */}
+      {hasVideo && !imageUrl && (
+        <div
+          aria-hidden
+          className="pointer-events-none absolute right-3 top-3 grid size-8 place-items-center rounded-full bg-brand/90 text-white opacity-0 shadow-lg transition-opacity group-hover:opacity-100"
+        >
+          <Play className="size-3.5 fill-current" />
+        </div>
+      )}
+
       {/* thumbnail — only when we actually have (or just made) an image; no
-          empty grey placeholder boxes for video-less episodes */}
+          empty grey placeholder boxes for clip-less lines */}
       {imageUrl && (
         <div className="relative aspect-video w-40 shrink-0 self-start overflow-hidden rounded-lg border border-border bg-bg-elevated">
           <img src={imageUrl} alt="" loading="lazy" className="size-full object-cover" />
+          {hasVideo && (
+            <div
+              aria-hidden
+              className="pointer-events-none absolute inset-0 grid place-items-center bg-black/0 opacity-0 transition-all group-hover:bg-black/40 group-hover:opacity-100"
+            >
+              <Play className="size-7 fill-white text-white drop-shadow" />
+            </div>
+          )}
           {audioUrl && (
             <button
-              onClick={toggleAudio}
+              onClick={(e) => {
+                e.stopPropagation();
+                toggleAudio();
+              }}
               aria-label={playing ? "Pause audio" : "Play audio"}
               className="absolute bottom-1.5 right-1.5 grid size-8 place-items-center rounded-full bg-black/60 text-white backdrop-blur-md transition-colors hover:bg-brand"
             >
@@ -360,7 +426,10 @@ function MomentCard({ moment, showIplus1 }: { moment: Moment; showIplus1: boolea
           </p>
         ) : (
           <button
-            onClick={() => translate.mutate(moment.line_id)}
+            onClick={(e) => {
+              e.stopPropagation();
+              translate.mutate(moment.line_id);
+            }}
             disabled={translate.isPending}
             className="mt-1.5 inline-flex items-center gap-1.5 self-start text-xs font-medium text-faint transition-colors hover:text-brand-bright disabled:opacity-60"
             title="Machine-translate this line"
@@ -375,6 +444,7 @@ function MomentCard({ moment, showIplus1 }: { moment: Moment; showIplus1: boolea
           {moment.title && (
             <Link
               to={`/title/${moment.anilist_id}`}
+              onClick={(e) => e.stopPropagation()}
               className="truncate font-medium text-muted transition-colors hover:text-brand-bright"
             >
               {moment.title}
@@ -387,24 +457,31 @@ function MomentCard({ moment, showIplus1 }: { moment: Moment; showIplus1: boolea
           <span className="shrink-0 tabular-nums">· {formatMs(moment.start_ms)}</span>
         </div>
 
-        {/* actions */}
+        {/* actions — the card itself plays the sentence; these are extras */}
         <div className="mt-3 flex flex-wrap items-center gap-2">
           {hasVideo && (
             <Button
-              variant="play"
+              variant="secondary"
               size="sm"
-              onClick={() => play.mutate(moment.line_id)}
+              onClick={(e) => {
+                e.stopPropagation();
+                play.mutate(moment.line_id);
+              }}
               loading={play.isPending}
+              title="Continue the episode from this line in Migaku — immersion features live"
             >
-              <Play className="size-3.5 fill-current" />
-              Play from here
+              <ExternalLink className="size-3.5" />
+              Play in Migaku
             </Button>
           )}
           {!imageUrl && hasVideo && (
             <Button
               variant="ghost"
               size="sm"
-              onClick={() => clip.mutate(moment.line_id, { onSuccess: setClipped })}
+              onClick={(e) => {
+                e.stopPropagation();
+                clip.mutate(moment.line_id, { onSuccess: setClipped });
+              }}
               loading={clip.isPending}
               title="Generate screenshot + audio clip from the video"
             >
@@ -415,7 +492,10 @@ function MomentCard({ moment, showIplus1 }: { moment: Moment; showIplus1: boolea
           <Button
             variant="secondary"
             size="sm"
-            onClick={() => anki.mutate([moment.line_id])}
+            onClick={(e) => {
+              e.stopPropagation();
+              anki.mutate([moment.line_id]);
+            }}
             loading={anki.isPending}
             title="Export this sentence to Anki (TSV)"
           >

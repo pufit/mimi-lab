@@ -638,26 +638,23 @@ def new_words(episode_id: int, limit: int = 200) -> list[NewWord]:
 # --------------------------------------------------------------------------
 
 
-def _clip_urls(line_id: int, has_video: bool) -> tuple[Optional[str], Optional[str]]:
-    """If clips already exist on disk for this line, return their static URLs;
-    else point at the on-demand extraction endpoint. Episodes WITHOUT a video
-    file get (None, None) — a clip can never be extracted for them, and the
-    old behavior (always emitting the endpoint URL) rendered grids of blank
-    thumbnail boxes for the ~99% of the corpus that is analysis-only."""
+def _clip_urls(line_id: int) -> tuple[Optional[str], Optional[str]]:
+    """Static /clips URLs when BOTH files exist on disk, else (None, None).
+
+    The old fallback emitted the POST-only /api/learn/clip endpoint string as
+    if it were media URLs: the UI rendered it as a broken <img> + a 405 audio
+    source, and (being truthy) it suppressed the explicit "Make clip" button.
+    Clip URLs now mean exactly "these files exist"; extraction is always an
+    explicit POST (clip button, sentence player warm-up, apkg export)."""
     img = settings.clips_dir / f"line_{line_id}.jpg"
     aud = settings.clips_dir / f"line_{line_id}.m4a"
     if img.exists() and aud.exists():
         return f"/clips/line_{line_id}.jpg", f"/clips/line_{line_id}.m4a"
-    if not has_video:
-        return None, None
-    # Not yet extracted: the API endpoint triggers extraction on POST.
-    endpoint = f"/api/learn/clip/{line_id}"
-    return endpoint, endpoint
+    return None, None
 
 
 def _moment_from_row(r, unknown_count: Optional[int] = None) -> Moment:
-    has_video = bool(r["video_path"])
-    img, aud = _clip_urls(r["line_id"], has_video)
+    img, aud = _clip_urls(r["line_id"])
     return Moment(
         line_id=r["line_id"],
         anilist_id=r["anilist_id"],
@@ -724,8 +721,14 @@ def moments_search(
     offset: int = 0,
     anilist_id: Optional[int] = None,
     sort: str = "position",
+    downloaded_only: bool = True,
 ) -> list[Moment]:
     """Find every subtitle line where `query` appears.
+
+    By default only DOWNLOADED content is searched (episodes with a local
+    video file) — every returned moment is playable/clippable, instead of
+    drowning results in the ~97% of the corpus that is analysis-only subs.
+    `downloaded_only=False` restores the whole-corpus search.
 
     Primary path: exact dictionary-form match via line_lemmas.lemma, then
     surface form — two separate indexed lookups (the old `lemma=? OR surface=?`
@@ -750,6 +753,8 @@ def moments_search(
     seen: set[int] = set()
     rows_out: list = []
     show_cond = "AND e.anilist_id = ? " if anilist_id else ""
+    if downloaded_only:
+        show_cond += "AND e.video_path IS NOT NULL AND e.video_path != '' "
 
     with connect() as cx:
         # --- primary: lemma, then surface — both hit their own index ---

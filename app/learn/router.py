@@ -82,13 +82,18 @@ def moments(
     offset: int = Query(0, ge=0),
     anilist_id: int | None = Query(None, description="filter to one show"),
     sort: str = Query("position", pattern="^(position|iplus1)$"),
+    downloaded: bool = Query(True, description="only lines from episodes with a local video file"),
 ):
-    """Word search across the library corpus -> moments (line + media anchors).
+    """Word search -> moments (line + media anchors).
 
-    sort=iplus1 puts the easiest mining sentences (fewest unknown words) first.
+    Defaults to DOWNLOADED content only, so every result can be played in the
+    browser / clipped; `downloaded=false` searches the full analysis corpus
+    (subs-only shows included). sort=iplus1 puts the easiest mining sentences
+    (fewest unknown words) first.
     """
     return service.moments_search(q, limit=limit, offset=offset,
-                                  anilist_id=anilist_id, sort=sort)
+                                  anilist_id=anilist_id, sort=sort,
+                                  downloaded_only=downloaded)
 
 
 @router.post("/clip/{line_id}")
