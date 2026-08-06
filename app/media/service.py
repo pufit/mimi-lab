@@ -649,10 +649,18 @@ def _parse_filename(name: str) -> dict:
     """anitopy parse of a release filename. Best-effort; returns {} on failure."""
     try:
         import anitopy
-        return anitopy.parse(name) or {}
+        parsed = anitopy.parse(name) or {}
     except Exception as e:
         log.warning("anitopy parse failed for %r: %s", name, e)
         return {}
+    # Fallback: anitopy can't tokenize 'S01E01-Title […].mkv' (episode token glued
+    # to the episode title, e.g. EMBER packs) — pull SxxExx out ourselves.
+    if not parsed.get("episode_number"):
+        m = re.search(r"\bS(\d{1,2})[ ._-]?E(\d{1,4})\b", name, re.I)
+        if m:
+            parsed["anime_season"] = m.group(1)
+            parsed["episode_number"] = m.group(2)
+    return parsed
 
 
 def _known_title_for_download(download_id: Optional[int]):
