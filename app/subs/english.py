@@ -27,6 +27,7 @@ import json
 import logging
 import lzma
 import re
+import shutil
 from pathlib import Path
 from typing import Optional
 
@@ -87,21 +88,25 @@ def _en_dest(ep: dict) -> Path:
 
 
 def _embedded_sidecar(ep: dict) -> Optional[Path]:
-    """The <base>.en.srt the media pipeline extracted from the release, if present.
+    """The embedded-English artifact the media pipeline extracted from this
+    episode's release, if present (``media.service.embedded_sub_artifact``).
 
-    Only a *genuinely* embedded track counts — not a file a previous english run
-    generated (mt / animetosho) at the same path. The extraction (media) writes
-    the file but no `subtitles` row, so 'no row yet' = embedded; a row tagged
-    mt/animetosho means the file was generated, not extracted."""
-    p = _en_dest(ep)
-    if not (p.exists() and p.stat().st_size > 0):
+    That path is written ONLY by the extraction, so its existence alone proves
+    provenance — unlike the served ``<base>.en.srt``, which mt/AnimeTosho runs
+    legitimately rewrite. (The old heuristic — 'no subtitles row yet = the file
+    is embedded' — silently discarded fresh extractions whenever an EN row
+    predated the video, e.g. subs fetched at title-add time; the MT rebuild
+    then overwrote the release's own track. Mashle E01-E12, Aug 2026.)
+    Structure is still gate-validated on every acceptance, never trusted."""
+    vp = ep.get("video_path")
+    if not vp:
         return None
-    with connect() as cx:
-        row = cx.execute(
-            "SELECT source FROM subtitles WHERE episode_id=? AND lang='en' "
-            "ORDER BY version DESC LIMIT 1", (ep["id"],),
-        ).fetchone()
-    if row and (row["source"] or "") != "embedded":
+    try:
+        from ..media.service import embedded_sub_artifact
+        p = embedded_sub_artifact(vp)
+    except Exception:  # pragma: no cover — defensive cross-module import
+        return None
+    if not (p.exists() and p.stat().st_size > 0):
         return None
     return p
 
@@ -487,13 +492,14 @@ def fetch_english_for_episode(episode_id: int) -> dict:
         emb = _embedded_sidecar(ep)
         if emb:
             # the release's own embedded English (extracted at post-process) — same
-            # file as the video, so already perfectly timed. Still gated: the file
-            # at the sidecar path may not be what the DB believes it is (anything
-            # can have (re)written it since extraction), so its structure is
-            # validated on EVERY acceptance, never trusted from provenance alone.
+            # file as the video, so already perfectly timed. Still gated (structure
+            # validated on EVERY acceptance, never trusted from provenance alone),
+            # then COPIED onto the served path — the artifact itself stays put so a
+            # later run can re-promote it even if a fallback rewrites the served file.
             ok, why = sub_display_sane(emb, vp)
             if ok:
-                have_path, used_source, aligned = emb, "embedded", 1
+                shutil.copyfile(emb, dest)
+                have_path, used_source, aligned = dest, "embedded", 1
             else:
                 log.warning("english: embedded sidecar for ep %s rejected (%s)",
                             episode_id, why)

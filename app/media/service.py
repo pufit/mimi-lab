@@ -579,11 +579,27 @@ def _strip_srt_markup(path: Path) -> None:
         log.debug("srt markup strip skipped for %s: %s", path, e)
 
 
+def embedded_sub_artifact(final_path: str | Path) -> Path:
+    """Where the raw embedded-English extraction artifact for a video lives:
+    ``Library/_subs/embedded/<video-stem>.en.srt``.
+
+    Deliberately NOT next to the video — ``<base>.en.srt`` beside the video is
+    the SERVED track (Migaku name-pairs it), which the english resolver's
+    mt/AnimeTosho fallbacks legitimately rewrite. Keeping the extraction at a
+    path only this module ever writes means (a) a generated track can never
+    clobber or pose as the release's own subs, and (b) the artifact survives
+    for later english runs even when a fallback won this one. Provenance is
+    the path itself; structure is still gate-validated on every acceptance."""
+    p = Path(final_path)
+    return settings.library_dir / "_subs" / "embedded" / (p.with_suffix("").name + ".en.srt")
+
+
 def extract_embedded_english(src: str | Path, final_path: str | Path) -> Optional[Path]:
-    """Extract the embedded English subtitle from the original release to
-    `<final_base>.en.srt`. Must run BEFORE the original is pruned. Best-effort:
-    returns the written path, or None (no English track / image subs / mismatched
-    track / error)."""
+    """Extract the embedded English subtitle from the original release to the
+    ``embedded_sub_artifact`` path (the english resolver validates + promotes it
+    onto the served `<final_base>.en.srt`). Must run BEFORE the original is
+    pruned. Best-effort: returns the written path, or None (no English track /
+    image subs / mismatched track / error)."""
     try:
         src = Path(src)
         final_path = Path(final_path)
@@ -592,7 +608,8 @@ def extract_embedded_english(src: str | Path, final_path: str | Path) -> Optiona
         sidx = _english_subtitle_stream(src)
         if sidx is None:
             return None
-        dest = final_path.with_suffix("").with_suffix(".en.srt")
+        dest = embedded_sub_artifact(final_path)
+        dest.parent.mkdir(parents=True, exist_ok=True)
         cmd = ["ffmpeg", "-y", "-i", str(src), "-map", f"0:s:{sidx}", "-c:s", "srt", str(dest)]
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=_SUBEXTRACT_TIMEOUT)
         if proc.returncode == 0 and dest.exists() and dest.stat().st_size > 0:
