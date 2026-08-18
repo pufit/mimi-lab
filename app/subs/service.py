@@ -1459,6 +1459,14 @@ def fetch_for_title(anilist_id: int) -> dict:
     calls than per-episode fetching."""
     import anitopy
 
+    from ..catalog import service as catalog
+
+    # Airing progress + episode count decide relative-vs-absolute numbering
+    # below, and a title first seen before it aired carries neither. Refresh
+    # before bucketing (best-effort — a stale row still imports, just without
+    # the folding safety net).
+    catalog.refresh_title_meta(anilist_id)
+
     entries = jimaku_search(anilist_id)
     if not entries:
         return {"anilist_id": anilist_id, "status": "no_entries", "episodes": 0}
@@ -1493,9 +1501,12 @@ def fetch_for_title(anilist_id: int) -> dict:
         ).fetchone()
     total_eps = (trow["total_episodes"] if trow else None) or None
 
-    # group subtitle files by SEASON-RELATIVE episode number (parsed + normalized)
-    by_ep: dict[int, list] = {}
-    skipped_out_of_range = 0
+    # parse every filename ONCE, then infer this entry's absolute→relative
+    # offset from the whole number set before bucketing. A single jimaku entry
+    # routinely carries both conventions for the same episodes (`S02E01..E03`
+    # from one group, `S02E13..E19` from another, and groups that switch
+    # mid-season), which per-file logic cannot separate — the set can.
+    parsed_eps: list[tuple[dict, Optional[int]]] = []
     for f in files:
         try:
             p = anitopy.parse(_file_name(f)) or {}
@@ -1504,7 +1515,27 @@ def fetch_for_title(anilist_id: int) -> dict:
         epn = p.get("episode_number")
         if isinstance(epn, list):
             epn = epn[0] if epn else None
-        rel = match_service.normalize_episode_number(anilist_id, epn, total_eps)
+        parsed_eps.append((f, epn))
+
+    ceiling = match_service.episode_ceiling(anilist_id, total_eps)
+    offset = match_service.infer_episode_offset(
+        (epn for _, epn in parsed_eps), ceiling
+    )
+    if offset:
+        log.info(
+            "title %s: absolute episode numbering detected (offset %d, %d aired) "
+            "— folding to season-relative",
+            anilist_id, offset, ceiling,
+        )
+        match_service.set_episode_offset(anilist_id, offset)
+
+    # group subtitle files by SEASON-RELATIVE episode number (parsed + normalized)
+    by_ep: dict[int, list] = {}
+    skipped_out_of_range = 0
+    for f, epn in parsed_eps:
+        rel = match_service.normalize_episode_number(
+            anilist_id, epn, total_eps, offset_hint=offset
+        )
         if rel is None:
             if epn is not None:
                 skipped_out_of_range += 1

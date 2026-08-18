@@ -442,31 +442,17 @@ def pull() -> dict:
         mapped += 1
 
     # Titles first seen via this pull exist only as stubs (ids + the MAL title
-    # string) — no cover/romaji/format, so the grid renders a blank card.
-    # Backfill every stub from AniList in one batched query. Scans the whole
-    # table (not just this pull) so previously-stubbed rows self-heal too.
+    # string) — no cover/romaji/format, so the grid renders a blank card. And a
+    # title that is still airing goes stale the moment it does: episode count
+    # and airing progress change under us. Re-fetch both classes from AniList in
+    # one batched query. Scans the whole table (not just this pull) so existing
+    # rows self-heal too.
     enriched = 0
-    if mapped and catalog_service is not None and match_service is not None:
+    if mapped and catalog_service is not None:
         try:
-            with cursor() as cx:
-                stub_ids = [
-                    r["anilist_id"] for r in cx.execute(
-                        "SELECT anilist_id FROM titles "
-                        "WHERE cover_url IS NULL OR cover_url='' "
-                        "   OR romaji IS NULL OR romaji=''"
-                    ).fetchall()
-                ]
-            if stub_ids:
-                for media in match_service.anilist_media_by_ids(stub_ids):
-                    try:
-                        catalog_service.upsert_title(media)
-                        enriched += 1
-                    except Exception as e:
-                        log.debug("enrich upsert_title(%s) skipped: %s", media.get("id"), e)
-                log.info("pull: enriched %d/%d stub title(s) from AniList",
-                         enriched, len(stub_ids))
+            enriched = catalog_service.refresh_stale_titles().get("refreshed", 0)
         except Exception as e:
-            log.warning("pull: stub enrichment failed: %s", e)
+            log.warning("pull: title refresh failed: %s", e)
 
     kv_set(KV_LAST_SYNC, str(int(time.time())))
     log.info("pull: %d nodes, %d mapped, %d unmapped", count, mapped, unmapped)

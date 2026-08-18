@@ -131,6 +131,22 @@ def anilist_search(title: str, *, max_retries: int = 4) -> list[dict]:
     return []
 
 
+def _aired_episodes(m: dict) -> Optional[int]:
+    """How many episodes of `m` have aired.
+
+    While a show is RELEASING, AniList publishes `nextAiringEpisode.episode`
+    (the number of the NEXT one), so aired == that - 1. Once it is FINISHED
+    there is no next episode and the full count is the answer. Anything else
+    (NOT_YET_RELEASED / unknown) has no meaningful answer -> None.
+    """
+    nxt = _to_int((m.get("nextAiringEpisode") or {}).get("episode"))
+    if nxt is not None and nxt > 0:
+        return nxt - 1
+    if m.get("status") == "FINISHED":
+        return _to_int(m.get("episodes"))
+    return None
+
+
 def _flatten_media(m: dict) -> dict:
     t = m.get("title") or {}
     return {
@@ -140,7 +156,10 @@ def _flatten_media(m: dict) -> dict:
         "english": t.get("english"),
         "native": t.get("native"),
         "episodes": m.get("episodes"),
+        "aired_episodes": _aired_episodes(m),
         "format": m.get("format"),
+        "status": m.get("status"),
+        "season": m.get("season"),
         "seasonYear": m.get("seasonYear"),
         "cover_url": (m.get("coverImage") or {}).get("large"),
         "banner_url": m.get("bannerImage"),
@@ -328,7 +347,8 @@ def anilist_media_by_id(anilist_id: int) -> Optional[dict]:
     query ($id: Int) {
       Media(id: $id, type: ANIME) {
         id idMal title { romaji english native }
-        episodes format seasonYear coverImage { large } bannerImage description
+        episodes format season seasonYear status nextAiringEpisode { episode }
+        coverImage { large } bannerImage description
       }
     }
     """.strip()
@@ -363,7 +383,8 @@ def anilist_media_by_ids(ids: list[int], *, max_retries: int = 4) -> list[dict]:
       Page(page: 1, perPage: 50) {
         media(id_in: $ids, type: ANIME) {
           id idMal title { romaji english native }
-          episodes format seasonYear coverImage { large } bannerImage description
+          episodes format season seasonYear status nextAiringEpisode { episode }
+          coverImage { large } bannerImage description
         }
       }
     }
@@ -568,50 +589,189 @@ def episode_offsets_for(anilist_id: int) -> list[int]:
     return list(e.get("offsets") or []) if e else []
 
 
+def infer_episode_offset(numbers, ceiling: Optional[int]) -> Optional[int]:
+    """Infer a season's absolute→relative offset from a SET of parsed episode
+    numbers (one release group's / one jimaku entry's files).
+
+    Release groups and subtitlers disagree about sequel numbering, and often
+    within a single batch: `S02E01..E03` (relative) can sit right next to
+    `S02E13..E19` (absolute) for the very same episodes. Per-number logic cannot
+    tell those apart — but the *set* can, once you know how many episodes have
+    actually aired (`ceiling`):
+
+      • numbers within 1..ceiling are relative;
+      • numbers above `ceiling` cannot be relative, so they are absolute, and
+        the lowest of them is that season's episode 1 → offset = min(high) - 1.
+
+    Two guards keep a wrong guess from corrupting the numbering — both decline
+    rather than fold, because a declined fold leaves a VISIBLE extra episode row
+    (prunable, obvious in the UI) while a wrong fold silently drops a real
+    episode onto one that is already ingested:
+
+      • every high number must fold back into 1..ceiling, so a stray special or
+        a mis-parsed number rejects the whole inference;
+      • the high run must be separated from the ceiling by a gap
+        (min(high) >= ceiling + 2). A number landing exactly one past the
+        ceiling is far more likely to be an episode that has just aired — subs
+        show up within minutes of broadcast, while AniList's airing data lags —
+        than the start of an absolute run. Cost: a sequel whose previous
+        season(s) are exactly as long as the part aired so far is not folded
+        until the offset is learned some other way.
+
+    Returns the offset (> 0), or None when there is nothing to fold / no
+    consistent offset. Deliberately NOT derived from AniList's PREQUEL chain:
+    that chain breaks on split cours (a season whose own prequel edge skips a
+    part) and then silently yields a wrong offset — measured 48 where the true
+    value was 72 — which is worse than not folding at all.
+    """
+    ceiling = _to_int(ceiling) or 0
+    if ceiling <= 0:
+        return None
+    nums = sorted({n for n in (_to_int(x) for x in numbers) if n is not None and n >= 1})
+    high = [n for n in nums if n > ceiling]
+    if not high:
+        return None
+    if min(high) < ceiling + 2:  # contiguous with the aired range → just aired
+        return None
+    off = min(high) - 1
+    if off <= 0:
+        return None
+    if not all(1 <= n - off <= ceiling for n in high):
+        return None
+    return off
+
+
+# AniList's airing data lags a broadcast by minutes to hours, while subtitles
+# for a fresh episode show up almost immediately. When a season's full length is
+# unknown we allow a folded number to land this far past the aired count rather
+# than discarding a just-aired episode.
+_AIRING_LAG_SLACK = 2
+
+
+def _season_bounds(anilist_id: int, total_episodes: Optional[int] = None
+                   ) -> tuple[int, int]:
+    """(ceiling, limit) for a season's episode numbering.
+
+    `ceiling` — the highest number that can legitimately be SEASON-RELATIVE
+    right now: the aired count when known (available even while a show is
+    ongoing and AniList has published no final length), else the total.
+
+    `limit` — the highest number a FOLDED result may take: the season's full
+    length when known, else the ceiling plus a little slack for airing lag.
+    A folded number may legitimately exceed the aired count when AniList's
+    airing data is behind the broadcast.
+    """
+    aired = None
+    total = _to_int(total_episodes)
+    try:
+        with cursor() as cx:
+            row = cx.execute(
+                "SELECT aired_episodes, total_episodes FROM titles WHERE anilist_id=?",
+                (anilist_id,),
+            ).fetchone()
+        if row is not None:
+            aired = _to_int(row["aired_episodes"])
+            total = total or _to_int(row["total_episodes"])
+    except Exception as e:  # column missing on an un-migrated DB, no DB in tests…
+        log.debug("_season_bounds(%s) lookup skipped: %s", anilist_id, e)
+    ceiling = aired or total or 0
+    limit = total or (ceiling + _AIRING_LAG_SLACK if ceiling else 0)
+    return ceiling, limit
+
+
+def episode_ceiling(anilist_id: int, total_episodes: Optional[int] = None) -> int:
+    """Highest episode number that can legitimately be SEASON-RELATIVE. 0 = unknown."""
+    return _season_bounds(anilist_id, total_episodes)[0]
+
+
+def stored_episode_offset(anilist_id: int) -> Optional[int]:
+    """The learned absolute→relative offset persisted on the title, if any."""
+    try:
+        with cursor() as cx:
+            row = cx.execute(
+                "SELECT episode_offset FROM titles WHERE anilist_id=?", (anilist_id,)
+            ).fetchone()
+        return _to_int(row["episode_offset"]) if row is not None else None
+    except Exception as e:
+        log.debug("stored_episode_offset(%s) lookup skipped: %s", anilist_id, e)
+        return None
+
+
+def set_episode_offset(anilist_id: int, offset: int) -> None:
+    """Persist a learned offset so single-file paths (a downloaded release, a
+    late subtitle sweep) fold the same way the batch pass did."""
+    off = _to_int(offset)
+    if not off or off <= 0:
+        return
+    with cursor() as cx:
+        cx.execute(
+            "UPDATE titles SET episode_offset=?, updated_at=datetime('now') "
+            "WHERE anilist_id=? AND COALESCE(episode_offset,0) <> ?",
+            (off, anilist_id, off),
+        )
+
+
 def normalize_episode_number(
     anilist_id: int,
     raw_ep,
     total_episodes: Optional[int],
+    *,
+    offset_hint: Optional[int] = None,
 ) -> Optional[int]:
     """Map a release/subtitle file's parsed episode number to a SEASON-RELATIVE
     number for `anilist_id`.
 
     Sequels are frequently numbered with ABSOLUTE (cross-season) episode numbers
     in release filenames. Left alone, each distinct number becomes its own
-    episode row and can inflate the season count. This folds absolute numbers
-    back using the Fribb `episode_offset`, validated against `total_episodes`.
+    episode row, inflating the season and duplicating episodes that were also
+    ingested under relative numbering. This folds absolute numbers back using,
+    in order of preference: an explicit `offset_hint` (inferred from the batch
+    being imported), the offset learned for this title, then the Fribb
+    `episode_offset`s — validated against the season's episode ceiling.
 
     Returns a relative episode number, or None if it can't be confidently placed
     within the season (caller should drop those files).
 
     Behaviour:
-      • a number already within 1..total is kept as-is (covers the common
+      • a number within 1..ceiling is kept as-is (covers the common
         relative-numbered and SxxEyy files; the rare absolute-vs-relative overlap
         on the first eps of a longer sequel defaults to relative);
-      • a number above total is folded by the offset that lands it in 1..total;
-      • when total is unknown, an offset is applied only if it keeps the number
-        positive (best effort), else the number is kept.
+      • a number above the ceiling is folded by the offset that lands it in
+        1..ceiling;
+      • when the ceiling is unknown, an offset is applied only if it keeps the
+        number positive (best effort), else the number is kept.
+
+    The ceiling is the AIRED episode count when known, else `total_episodes`.
+    Using the aired count matters for an ongoing sequel: AniList often publishes
+    no final length for one, and a 0 ceiling used to disable this whole function
+    (every parsed number passed straight through, which is exactly how a season
+    ends up holding both `1,2,3` and `13,14,15` for the same three episodes).
     """
     raw = _to_int(raw_ep)
     if raw is None or raw < 0:
         return None
 
-    total = _to_int(total_episodes) or 0
-    if 1 <= raw <= total:
+    ceiling, limit = _season_bounds(anilist_id, total_episodes)
+    if 1 <= raw <= ceiling:
         return raw
 
-    offsets = episode_offsets_for(anilist_id)
+    offsets = [o for o in (offset_hint, stored_episode_offset(anilist_id)) if o]
+    offsets += [o for o in episode_offsets_for(anilist_id) if o not in offsets]
 
-    if total > 0:
-        # raw is outside 1..total → try to fold an absolute number into range.
+    if ceiling > 0:
+        # raw is outside 1..ceiling → try to fold an absolute number into range.
         # Prefer the largest offset that fits (later cours have larger offsets).
         for off in sorted(offsets, reverse=True):
             rel = raw - off
-            if 1 <= rel <= total:
+            if 1 <= rel <= limit:
                 return rel
+        # No offset places it. It may still be an episode that has just aired,
+        # ahead of AniList's airing data — keep it if it fits the season at all.
+        if 1 <= raw <= limit:
+            return raw
         return None  # can't place it in this season → drop (don't inflate)
 
-    # total unknown (ongoing/unmapped): best-effort offset, else keep raw.
+    # ceiling unknown (unmapped/not yet aired): best-effort offset, else keep raw.
     for off in sorted(offsets, reverse=True):
         if raw - off >= 1:
             return raw - off

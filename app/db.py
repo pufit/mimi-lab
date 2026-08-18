@@ -24,6 +24,8 @@ CREATE TABLE IF NOT EXISTS titles (
   native            TEXT,
   format            TEXT,
   total_episodes    INTEGER,
+  aired_episodes    INTEGER,
+  episode_offset    INTEGER,
   season            TEXT,
   year              INTEGER,
   cover_url         TEXT,
@@ -302,6 +304,17 @@ _MIGRATIONS: list[tuple[str, str, str]] = [
     # when an episode was marked watched (manual toggle or playback telemetry) —
     # drives the Stats page's watched-per-day series.
     ("episodes", "watched_at", "TEXT"),
+    # how many episodes of this season have actually AIRED (AniList
+    # nextAiringEpisode.episode - 1; == total_episodes once FINISHED). This is
+    # the ceiling for a legitimately season-relative episode number: a file
+    # numbered above it cannot be relative, so it must be absolute
+    # (cross-season) numbering. Unlike total_episodes it is known even for an
+    # ongoing show whose final length AniList doesn't publish yet.
+    ("titles", "aired_episodes", "INTEGER"),
+    # absolute -> relative episode offset for a sequel (episodes aired before
+    # this season). Learned from the release/subtitle numbering itself and
+    # validated against aired_episodes; see match.infer_episode_offset.
+    ("titles", "episode_offset", "INTEGER"),
 ]
 
 

@@ -71,6 +71,7 @@ def upsert_title(anilist: dict) -> int:
 
     fmt = anilist.get("format")
     total_eps = _to_int(anilist.get("episodes") or anilist.get("total_episodes"))
+    aired_eps = _to_int(anilist.get("aired_episodes"))
     year = _to_int(anilist.get("seasonYear") or anilist.get("year"))
     season = anilist.get("season")
     status = anilist.get("status")
@@ -96,9 +97,9 @@ def upsert_title(anilist: dict) -> int:
             """
             INSERT INTO titles
               (anilist_id, mal_id, tvdb_id, romaji, english, native, format,
-               total_episodes, season, year, cover_url, banner_url, description,
-               status, local_updated_at, updated_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?, datetime('now'), datetime('now'))
+               total_episodes, aired_episodes, season, year, cover_url,
+               banner_url, description, status, local_updated_at, updated_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, datetime('now'), datetime('now'))
             ON CONFLICT(anilist_id) DO UPDATE SET
               mal_id        = COALESCE(excluded.mal_id, titles.mal_id),
               tvdb_id       = COALESCE(excluded.tvdb_id, titles.tvdb_id),
@@ -107,20 +108,94 @@ def upsert_title(anilist: dict) -> int:
               native        = COALESCE(excluded.native, titles.native),
               format        = COALESCE(excluded.format, titles.format),
               total_episodes= COALESCE(excluded.total_episodes, titles.total_episodes),
+              aired_episodes= COALESCE(excluded.aired_episodes, titles.aired_episodes),
               season        = COALESCE(excluded.season, titles.season),
               year          = COALESCE(excluded.year, titles.year),
               cover_url     = COALESCE(excluded.cover_url, titles.cover_url),
               banner_url    = COALESCE(excluded.banner_url, titles.banner_url),
               description   = COALESCE(excluded.description, titles.description),
               status        = COALESCE(excluded.status, titles.status),
+              -- only a payload that actually carried AniList metadata counts as
+              -- a refresh; a MAL-pull stub (ids + title string) must not make a
+              -- stale row look freshly synced.
+              local_updated_at = CASE WHEN excluded.total_episodes IS NOT NULL
+                                       OR excluded.status IS NOT NULL
+                                      THEN datetime('now')
+                                      ELSE titles.local_updated_at END,
               updated_at    = datetime('now')
             """,
             (
                 anilist_id, mal_id, tvdb_id, romaji, english, native, fmt,
-                total_eps, season, year, cover, banner, description, status,
+                total_eps, aired_eps, season, year, cover, banner, description,
+                status,
             ),
         )
     return anilist_id
+
+
+# AniList statuses that can still change (episode counts, airing progress). A
+# title in one of these is re-fetched by `refresh_stale_titles`; FINISHED /
+# CANCELLED rows are final and never re-queried.
+_LIVE_STATUSES = ("RELEASING", "NOT_YET_RELEASED", "HIATUS")
+
+
+def refresh_title_meta(anilist_id: int) -> bool:
+    """Re-fetch one title's AniList metadata. Best-effort; returns True on success.
+
+    Called before a batch subtitle import: episode counts and airing progress
+    are what decide relative-vs-absolute numbering, and a row first seen while
+    the show was NOT_YET_RELEASED carries neither.
+    """
+    try:
+        from ..match import service as match_service
+
+        media = match_service.anilist_media_by_id(int(anilist_id))
+        if not media:
+            return False
+        upsert_title(media)
+        return True
+    except Exception as e:
+        log.warning("refresh_title_meta(%s) failed: %s", anilist_id, e)
+        return False
+
+
+def refresh_stale_titles(max_titles: int = 200) -> dict:
+    """Re-fetch AniList metadata for every title that isn't finished, plus any
+    stub row (ids + a MAL title string, no cover/romaji — renders as a blank card).
+
+    `upsert_title` has always handled updates, but nothing ever called it again
+    for a title that already looked complete — so a show first seen as
+    NOT_YET_RELEASED kept `total_episodes = NULL` and `status =
+    'NOT_YET_RELEASED'` forever, silently disabling every episode-count-gated
+    safety net (episode backfill, absolute-number folding, phantom pruning).
+    """
+    from ..match import service as match_service
+
+    with cursor() as cx:
+        ids = [
+            r["anilist_id"]
+            for r in cx.execute(
+                "SELECT anilist_id FROM titles "
+                "WHERE status IS NULL OR status IN (%s) "
+                "   OR cover_url IS NULL OR cover_url='' "
+                "   OR romaji IS NULL OR romaji='' "
+                "ORDER BY COALESCE(local_updated_at,'') ASC LIMIT ?"
+                % ",".join("?" * len(_LIVE_STATUSES)),
+                (*_LIVE_STATUSES, int(max_titles)),
+            )
+        ]
+    if not ids:
+        return {"checked": 0, "refreshed": 0}
+
+    refreshed = 0
+    for media in match_service.anilist_media_by_ids(ids):
+        try:
+            upsert_title(media)
+            refreshed += 1
+        except Exception as e:
+            log.debug("refresh upsert_title(%s) skipped: %s", media.get("id"), e)
+    log.info("refresh_stale_titles: %d/%d title(s) refreshed", refreshed, len(ids))
+    return {"checked": len(ids), "refreshed": refreshed}
 
 
 def get_titles() -> list[Title]:
@@ -341,6 +416,141 @@ def prune_phantom_episodes(anilist_id: Optional[int] = None) -> dict:
         len(ep_ids), len(titles_affected),
     )
     return {"removed": len(ep_ids), "titles": titles_affected}
+
+
+def _fold_candidates(cx, anilist_id: Optional[int]) -> list[int]:
+    q = "SELECT DISTINCT anilist_id FROM episodes"
+    params: tuple = ()
+    if anilist_id is not None:
+        q += " WHERE anilist_id = ?"
+        params = (int(anilist_id),)
+    return [r["anilist_id"] for r in cx.execute(q, params)]
+
+
+def _fold_rank(row) -> tuple:
+    """Sort key for choosing which row of a duplicate pair survives.
+
+    Never discard real media or watch progress; past that, keep the better
+    subtitle (objective alignment score first, then the fuller transcript).
+    """
+    return (
+        1 if (row["video_path"] or "") else 0,
+        1 if (row["watched"] or row["watch_progress_ms"]) else 0,
+        row["align_score"] if row["align_score"] is not None else -1.0,
+        row["line_count"] or 0,
+    )
+
+
+def fold_absolute_episodes(anilist_id: Optional[int] = None, *,
+                           apply: bool = False) -> dict:
+    """Repair episode rows that were created under ABSOLUTE (cross-season)
+    numbering, folding them onto their true season-relative numbers.
+
+    Before the ingest path learned to fold (match.infer_episode_offset), a
+    sequel could end up holding the same episode twice — once as `1` and once
+    as `13` — plus later episodes stranded at absolute numbers with no relative
+    twin at all. This renumbers the stranded rows and merges the duplicate
+    pairs, keeping whichever row carries media / watch progress / the better
+    subtitle.
+
+    Dry-run by default: pass apply=True to write. Returns the plan either way.
+    """
+    plan: list[dict] = []
+    offsets_learned: dict[int, int] = {}
+    with cursor() as cx:
+        for aid in _fold_candidates(cx, anilist_id):
+            rows = cx.execute(
+                """
+                SELECT e.id, e.ep_number, e.video_path, e.watched,
+                       e.watch_progress_ms,
+                       (SELECT MAX(s.align_score) FROM subtitles s
+                         WHERE s.episode_id = e.id) AS align_score,
+                       (SELECT COUNT(*) FROM subtitle_lines sl
+                         JOIN subtitles s2 ON s2.id = sl.subtitle_id
+                        WHERE s2.episode_id = e.id) AS line_count
+                  FROM episodes e WHERE e.anilist_id = ?
+                """,
+                (aid,),
+            ).fetchall()
+            if not rows:
+                continue
+
+            from ..match import service as match_service
+
+            ceiling = match_service.episode_ceiling(aid)
+            offset = match_service.infer_episode_offset(
+                [r["ep_number"] for r in rows], ceiling
+            )
+            if not offset:
+                continue
+
+            # Remember it: after this repair the absolute rows are gone, so the
+            # set-based inference can never re-derive the offset — and a later
+            # single file (one downloaded release, a late subtitle sweep) still
+            # needs it to fold instead of being dropped as unplaceable.
+            offsets_learned[aid] = offset
+
+            by_number = {r["ep_number"]: r for r in rows}
+            for row in sorted(rows, key=lambda r: r["ep_number"]):
+                if row["ep_number"] <= ceiling:
+                    continue
+                target = row["ep_number"] - offset
+                twin = by_number.get(target)
+                if twin is None:
+                    plan.append({
+                        "anilist_id": aid, "action": "renumber",
+                        "keep_id": row["id"], "from": row["ep_number"],
+                        "to": target, "drop_id": None,
+                    })
+                    continue
+                keep, drop = (row, twin) if _fold_rank(row) > _fold_rank(twin) \
+                    else (twin, row)
+                plan.append({
+                    "anilist_id": aid, "action": "merge",
+                    "keep_id": keep["id"], "from": row["ep_number"],
+                    "to": target, "drop_id": drop["id"],
+                })
+
+        if apply and plan:
+            # losers first — UNIQUE(anilist_id, ep_number) would reject a
+            # renumber onto a row that is still present.
+            drop_ids = [p["drop_id"] for p in plan if p["drop_id"]]
+            if drop_ids:
+                qmarks = ",".join("?" * len(drop_ids))
+                # FTS has no FK cascade — clear it explicitly, as prune does.
+                cx.execute(
+                    f"DELETE FROM subtitle_fts WHERE episode_id IN ({qmarks})",
+                    drop_ids,
+                )
+                cx.execute(
+                    f"DELETE FROM episodes WHERE id IN ({qmarks})", drop_ids
+                )
+            for p in sorted(plan, key=lambda x: x["to"]):
+                cx.execute(
+                    "UPDATE episodes SET ep_number=?, title=?, "
+                    "updated_at=datetime('now') WHERE id=?",
+                    (p["to"], f"Episode {p['to']}", p["keep_id"]),
+                )
+            for aid, off in offsets_learned.items():
+                cx.execute(
+                    "UPDATE titles SET episode_offset=?, updated_at=datetime('now') "
+                    "WHERE anilist_id=? AND COALESCE(episode_offset,0) <> ?",
+                    (off, aid, off),
+                )
+
+    titles_affected = sorted({p["anilist_id"] for p in plan})
+    log.info(
+        "fold_absolute_episodes: %d row(s) across %d title(s)%s",
+        len(plan), len(titles_affected), "" if apply else " (dry run)",
+    )
+    return {
+        "applied": bool(apply),
+        "changes": len(plan),
+        "merged": sum(1 for p in plan if p["action"] == "merge"),
+        "renumbered": sum(1 for p in plan if p["action"] == "renumber"),
+        "titles": titles_affected,
+        "plan": plan,
+    }
 
 
 def delete_title(anilist_id: int, delete_files: bool = True) -> dict:

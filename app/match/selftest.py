@@ -95,6 +95,42 @@ def _deterministic_checks() -> None:
         and margin >= service.CONFIDENT_MARGIN,
         f"score={by_id[MAIN_ID].score:.3f} margin={margin:.3f}",
     )
+    _offset_checks()
+
+
+# (numbers seen in one batch, aired ceiling, expected offset, label)
+_OFFSET_CASES = [
+    ([1, 2, 3, 13, 14, 15, 16, 17, 18, 19], 7, 12,
+     "mixed relative+absolute in one entry folds (S1 was 12 eps)"),
+    (list(range(1, 19)) + list(range(73, 91)), 18, 72,
+     "long-running sequel folds (3 prior seasons = 72 eps)"),
+    ([13, 14, 15, 16, 17, 18, 19], 7, 12,
+     "absolute-only batch still folds"),
+    (["01", "02", "13", "14"], 2, 12,
+     "anitopy's string episode numbers are accepted"),
+    ([1, 2, 3, 4, 5], 5, None,
+     "all-relative batch has nothing to fold"),
+    ([1, 2, 3], 0, None,
+     "unknown ceiling declines (cannot tell relative from absolute)"),
+    ([1, 2, 3, 8], 7, None,
+     "number one past the ceiling is a just-aired episode, not absolute"),
+    ([1, 2, 3, 4, 5, 6, 7, 8, 9], 7, None,
+     "two just-aired episodes ahead of a lagging ceiling still decline"),
+    ([1, 2, 3, 13, 14, 15, 99], 7, None,
+     "one number that folds out of range rejects the whole inference"),
+    ([1, 2, 25, 26], 12, 24,
+     "third season folds by the two prior seasons"),
+    ([], 7, None, "empty batch"),
+    ([0, -3, None], 7, None, "junk numbers"),
+]
+
+
+def _offset_checks() -> None:
+    """`infer_episode_offset` — absolute→relative folding from a whole batch."""
+    for numbers, ceiling, expected, label in _OFFSET_CASES:
+        got = service.infer_episode_offset(numbers, ceiling)
+        check(f"offset: {label}", got == expected,
+              f"ceiling={ceiling} -> {got} (expected {expected})")
 
 
 def _live_checks() -> None:
