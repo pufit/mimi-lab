@@ -127,7 +127,7 @@ def _check_reference_hygiene() -> None:
     """A typeset fansub track (karaoke frames, vector-drawing commands, per-glyph
     credit animations) must reduce to its dialogue cues before it is scored
     against or aligned to — otherwise onset agreement rewards piling JA cues
-    onto OP/ED storms (the Re:Zero S3E01 mangling, 2026-07-21)."""
+    onto OP/ED storms (the Re:Example S3E01 mangling, 2026-07-21)."""
     import tempfile
     import pysubs2
     print("--- reference hygiene ---")
@@ -286,6 +286,58 @@ def _check_track_sanity() -> None:
            "はい", "ええそうです"} == set(texts), f"{texts}")
 
 
+def _check_episode_bucketing() -> None:
+    """Per-episode candidate discovery must see EVERY upload for an episode,
+    whichever numbering the uploader used. A sequel's jimaku entry mixes
+    season-relative (`S04E16`) and absolute (`- 88`, `S04E88`, even `S06E88`)
+    names for the same episode; jimaku's own `?episode=16` filter returns only
+    the former — which is how Slime S4 E16/E19 got fetched from broadcast
+    captions while the better-timed streaming CCs sat unseen under 88/91
+    (2026-09-02). Bucketing folds the whole set with one inferred offset."""
+    print("--- episode bucketing (relative + absolute numbering) ---")
+    fake = FAKE_ANILIST + 1
+    with cursor() as cx:
+        cx.execute("DELETE FROM titles WHERE anilist_id=?", (fake,))
+        cx.execute(
+            "INSERT INTO titles(anilist_id,romaji,format,total_episodes,aired_episodes) "
+            "VALUES(?,?,?,?,?)", (fake, "Fake Sequel 4th Season", "TV", 24, 20),
+        )
+    try:
+        names = [
+            "[NanakoRaws] Fake Sequel S04E16 (CTV 1080p HEVC AAC).srt",   # relative
+            "[NanakoRaws] Fake Sequel S04E16 (CTV 1080p HEVC AAC).ass",
+            "[shincaps] Fake Sequel - 88 (AT-X 1440x1080 MPEG2 AAC).srt",  # absolute
+            "偽物の続編.S04E88.WEBRip.ABEMA.ja[cc].srt",                    # absolute, CJK title
+            "偽物の続編.S06E88.夜明け.WEBRip.Netflix.ja[cc].srt",            # absolute, odd season tag
+            "S04E16-Glued.Title[Fake].srt",                                 # anitopy can't tokenize
+            "[shincaps] Fake Sequel - 73 (AT-X 1440x1080 MPEG2 AAC).srt",  # absolute ep 1
+            "[NanakoRaws] Fake Sequel S04E03 (CTV 1080p HEVC AAC).srt",
+            "偽物の続編.S04E75.第75話.WEBRip.Amazon.ja-jp[sdh].srt",         # absolute ep 3
+            "Fake Sequel - NCOP.srt",                                        # no episode number
+        ]
+        by_ep, offset, skipped = S._bucket_files_by_episode(fake, [{"name": n} for n in names])
+        check("bucketing infers the absolute→relative offset", offset == 72, f"offset={offset}")
+        e16 = sorted(f["name"] for f in by_ep.get(16, []))
+        check("bucketing unites relative + absolute + glued names for one episode",
+              len(e16) == 6, f"{len(e16)} files for ep 16: {e16}")
+        check("bucketing folds 75 → 3 alongside S04E03",
+              len(by_ep.get(3, [])) == 2, f"{[f['name'] for f in by_ep.get(3, [])]}")
+        check("bucketing folds 73 → 1", len(by_ep.get(1, [])) == 1,
+              f"{[f['name'] for f in by_ep.get(1, [])]}")
+        check("bucketing drops nothing that carried a number", skipped == 0, f"skipped={skipped}")
+        check("bucketing ignores un-numbered files",
+              "Fake Sequel - NCOP.srt" not in {f["name"] for fs in by_ep.values() for f in fs},
+              f"episodes={sorted(by_ep)}")
+        with connect() as cx:
+            row = cx.execute(
+                "SELECT episode_offset FROM titles WHERE anilist_id=?", (fake,)).fetchone()
+        check("bucketing persists the learned offset on the title",
+              row is not None and row["episode_offset"] == 72, f"{dict(row) if row else None}")
+    finally:
+        with cursor() as cx:
+            cx.execute("DELETE FROM titles WHERE anilist_id=?", (fake,))
+
+
 def main() -> int:
     print("=== app.subs selftest ===\n")
     init_db()
@@ -296,6 +348,8 @@ def main() -> int:
     _check_reference_hygiene()
     print()
     _check_track_sanity()
+    print()
+    _check_episode_bucketing()
     print()
 
     if not VIDEO.exists() or not SUB.exists():
@@ -320,6 +374,52 @@ def main() -> int:
                 "SELECT id FROM episodes WHERE anilist_id=? AND ep_number=1", (FAKE_ANILIST,)
             ).fetchone()["id"]
         print(f"fake episode_id = {episode_id}\n")
+
+        # --- trusted-reference resolution: served sidecar → embedded artifact ---
+        # lib/TestShow ships a 4-cue <base>.en.srt beside the video: too thin to
+        # anchor an episode (below _REF_MIN_DIALOGUE_CUES), so the resolver must
+        # fall through to the extraction artifact — exactly the state a fresh
+        # download is in while its JA candidates are scored (the artifact exists,
+        # the served copy is only promoted later by english_subtitle_fetch).
+        print("--- trusted reference: served sidecar → embedded artifact ---")
+        import pysubs2
+        from app.media.service import embedded_sub_artifact
+        artifact = embedded_sub_artifact(VIDEO)
+        # a real extraction artifact may already exist for the fixture (the media
+        # selftest / connector self-check process this video) — park it for the
+        # duration so the checks see a controlled state, then put it back.
+        parked = artifact.with_name(artifact.name + ".selftest-parked")
+        had_artifact = artifact.exists()
+        if had_artifact:
+            artifact.replace(parked)
+        try:
+            fake_ep = {"id": episode_id, "video_path": str(VIDEO)}
+            check("reference: a thin served sidecar alone is not trusted",
+                  S._reference_sub_for(fake_ep) is None)
+            ref_track = pysubs2.SSAFile()
+            for i in range(60):  # 2 onsets/s, 400ms cues — all inside the 30s runtime
+                ref_track.append(pysubs2.SSAEvent(
+                    start=i * 500, end=i * 500 + 400, text=f"ref line {i}"))
+            artifact.parent.mkdir(parents=True, exist_ok=True)
+            ref_track.save(str(artifact))
+            got = S._reference_sub_for(fake_ep)
+            check("reference: falls through to the embedded artifact",
+                  got is not None and got.resolve() == artifact.resolve(), f"{got}")
+            with cursor() as cx:
+                cx.execute(
+                    "INSERT INTO subtitles(episode_id,source,lang,path,aligned) VALUES(?,?,?,?,1)",
+                    (episode_id, "mt", "en", str(VIDEO.with_suffix("").with_suffix(".en.srt"))),
+                )
+            got_mt = S._reference_sub_for(fake_ep)
+            check("reference: an MT row disqualifies the served sidecar, artifact still wins",
+                  got_mt is not None and got_mt.resolve() == artifact.resolve(), f"{got_mt}")
+            with cursor() as cx:
+                cx.execute("DELETE FROM subtitles WHERE episode_id=? AND source='mt'", (episode_id,))
+        finally:
+            artifact.unlink(missing_ok=True)
+            if had_artifact:
+                parked.replace(artifact)
+        print()
 
         # --- ingest the TestShow sub ---
         # ingest_subtitle rewrites its input .srt with the cleaned cues, so work

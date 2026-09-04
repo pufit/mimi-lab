@@ -28,7 +28,7 @@ logging.getLogger("apscheduler").setLevel(logging.WARNING)
 log = logging.getLogger("mimi_lab")
 
 # modules that expose an APIRouter at app.<name>.router:router
-MODULES = ["catalog", "match", "subs", "learn", "known", "acquire", "media", "mal", "watch", "connector", "events", "analyze", "jobs"]
+MODULES = ["catalog", "match", "subs", "learn", "known", "acquire", "media", "mal", "watch", "connector", "events", "analyze", "jobs", "srs"]
 
 
 @asynccontextmanager
@@ -127,6 +127,30 @@ for _m in MODULES:
         log.info("loaded module: %s", _m)
     except Exception as e:
         log.warning("module %s not loaded: %s", _m, e)
+
+
+_API_CATCH_ALL = "/api/{rest:path}"
+
+
+@app.api_route(_API_CATCH_ALL, methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
+               include_in_schema=False)
+def api_not_found(rest: str, request: Request):
+    """Any `/api/...` path no router claims is a real 404 — for every method.
+
+    Registered after the module routers (so real endpoints always win) and
+    before the SPA mount, whose StaticFiles answers unmatched POSTs with 405
+    ("method not allowed" on a route that no longer exists is misleading — a
+    retired endpoint is *gone*, SRS_DESIGN §10.2). A path that does exist under
+    a different method still gets 405.
+    """
+    path = request.url.path
+    for route in app.router.routes:
+        rx = getattr(route, "path_regex", None)
+        if rx is None or getattr(route, "path", None) == _API_CATCH_ALL:
+            continue
+        if getattr(route, "methods", None) and rx.match(path):
+            raise StarletteHTTPException(status_code=405, detail="method not allowed")
+    raise StarletteHTTPException(status_code=404, detail=f"no such endpoint: {path}")
 
 
 # static: extracted clips + the built web SPA (mounted last so /api wins)

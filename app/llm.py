@@ -27,6 +27,22 @@ ANTHROPIC_VERSION = "2023-06-01"
 # the heuristic on a blip 429/529)
 _RETRYABLE = {429, 500, 502, 503, 529}
 
+# Why the last call returned None. Callers that must RAISE on failure (the SRS
+# judge jobs) put this in their error message — otherwise a schema regression or
+# an expired key looks like "judge unavailable" with no cause anywhere.
+_LAST_ERROR: Optional[str] = None
+
+
+def last_error() -> Optional[str]:
+    """Reason the most recent `claude_json` call failed (None after a success)."""
+    return _LAST_ERROR
+
+
+def _fail(reason: str, *, level: int = logging.INFO) -> None:
+    global _LAST_ERROR
+    _LAST_ERROR = reason
+    log.log(level, "Claude: %s", reason)
+
 
 def available() -> bool:
     """True if an Anthropic API key is configured."""
@@ -77,6 +93,7 @@ def claude_json(
     schema: Optional[dict] = None,
     max_tokens: int = 512,
     timeout: float = 20.0,
+    effort: Optional[str] = None,
 ) -> Optional[dict]:
     """Call a Claude model and return a parsed JSON object, or None on any failure.
 
@@ -84,11 +101,15 @@ def claude_json(
     `settings.translation_model` (Sonnet) for heavier work like translation.
 
     When `schema` (a JSON Schema) is given, the response is constrained to it via
-    `output_config.format` so the reply is guaranteed parseable. We omit the
-    `thinking`/`effort` params (Haiku doesn't support them). Never raises —
-    callers treat None as "LLM unavailable, fall back".
+    `output_config.format` so the reply is guaranteed parseable. `thinking` is
+    never sent (Haiku rejects it; Opus/Sonnet 4.6+ think adaptively by default);
+    `effort` (low|medium|high|xhigh|max) is forwarded via `output_config` only
+    when given — Haiku rejects it. Never raises — callers treat None as "LLM
+    unavailable, fall back".
     """
+    global _LAST_ERROR
     if not settings.anthropic_api_key:
+        _fail("no ANTHROPIC_API_KEY configured")
         return None
 
     body: dict = {
@@ -99,6 +120,8 @@ def claude_json(
     }
     if schema is not None:
         body["output_config"] = {"format": {"type": "json_schema", "schema": schema}}
+    if effort:
+        body.setdefault("output_config", {})["effort"] = effort
 
     headers = {
         "x-api-key": settings.anthropic_api_key,
@@ -115,22 +138,30 @@ def claude_json(
                 log.info("Claude %s — retrying once in %.1fs", r.status_code, retry_after)
                 time.sleep(retry_after)
                 continue
+            if r.status_code >= 400:
+                # A non-retryable 4xx is a real defect (bad key, bad model id, a
+                # schema the API rejects) and used to vanish into a one-line INFO
+                # with no body — log status + body so the cause is on record.
+                _fail(f"HTTP {r.status_code} from {body['model']}: {r.text[:500]}",
+                      level=logging.WARNING)
+                return None
             r.raise_for_status()
             data = r.json()
             break
         except httpx.TimeoutException as e:
-            log.info("Claude call timed out (%s) — falling back", e)
+            _fail(f"timeout after {timeout}s ({e})")
             return None
         except Exception as e:  # network, auth, rate limit, etc. — degrade
-            log.info("Claude call failed (%s) — falling back", e)
+            _fail(f"call failed ({type(e).__name__}: {e})")
             return None
     if data is None:
+        _fail(f"no response from {body['model']} after retry")
         return None
     _record_usage(body["model"], data.get("usage") or {})
 
     # refusal / non-text stop — bail
     if data.get("stop_reason") == "refusal":
-        log.info("Claude refused the request — falling back")
+        _fail("model refused the request")
         return None
 
     text = ""
@@ -139,17 +170,22 @@ def claude_json(
             text += block.get("text", "")
     text = text.strip()
     if not text:
+        _fail(f"empty response (stop_reason={data.get('stop_reason')})")
         return None
 
     try:
-        return json.loads(text)
+        out = json.loads(text)
+        _LAST_ERROR = None
+        return out
     except json.JSONDecodeError:
         # tolerate a fenced ```json block if the model added one
         cleaned = text.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
         try:
-            return json.loads(cleaned)
+            out = json.loads(cleaned)
+            _LAST_ERROR = None
+            return out
         except json.JSONDecodeError:
-            log.info("Claude returned non-JSON output — falling back")
+            _fail(f"non-JSON output ({text[:200]!r})")
             return None
 
 

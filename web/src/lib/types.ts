@@ -1,5 +1,7 @@
 // Mirrors app/models.py — keep field names exact.
 
+export type * from "./srs-types";
+
 export interface Title {
   anilist_id: number;
   mal_id?: number | null;

@@ -282,7 +282,11 @@ function DownloadRow({ dl }: { dl: Download }) {
   const pct = Math.round((dl.progress ?? 0) * 100);
   const state = dl.state.toLowerCase();
   const failed = isFailedState(state);
-  const done = !failed && (DONE_STATES.has(state) || pct >= 100);
+  // 'completed' = the torrent is done but the episode is still being imported
+  // (an HEVC episode is transcoded to MP4 — minutes). It is NOT finished yet:
+  // shown as done, it read as "downloaded, but nothing appeared".
+  const importing = !failed && state === "completed";
+  const done = !failed && !importing && (DONE_STATES.has(state) || pct >= 100);
   const cancelled = state === "cancelled";
   const canCancel = !TERMINAL_STATES.has(state) && pct < 100;
   return (
@@ -302,9 +306,15 @@ function DownloadRow({ dl }: { dl: Download }) {
         </p>
         <Badge
           variant={cancelled ? "outline" : failed ? "danger" : done ? "success" : "default"}
-          title={failed ? `Download state: ${dl.state}` : undefined}
+          title={
+            failed
+              ? `Download state: ${dl.state}`
+              : importing
+                ? "Torrent finished — converting to a browser-playable MP4 (a 1080p HEVC episode takes ~5 min)"
+                : undefined
+          }
         >
-          {failed ? failedStateLabel(state) : dl.state}
+          {failed ? failedStateLabel(state) : importing ? "Importing…" : dl.state}
         </Badge>
         {failed && (
           <Button
@@ -353,6 +363,12 @@ function DownloadRow({ dl }: { dl: Download }) {
             : state === "completed"
               ? `Importing episodes · ${dl.done_files ?? 0}/${dl.total_files}`
               : `Season pack · ${dl.total_files} episodes`}
+        </div>
+      )}
+      {dl.kind !== "batch" && importing && (
+        <div className="mt-1.5 flex items-center gap-1.5 text-[0.7rem] text-brand-bright">
+          <Loader2 className="size-3 animate-spin" />
+          Converting to MP4 — the episode appears in the library when this finishes (~5 min for 1080p HEVC)
         </div>
       )}
       {(dl.resolution || dl.size_bytes) && (

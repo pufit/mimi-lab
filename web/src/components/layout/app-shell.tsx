@@ -26,6 +26,7 @@ import {
   useTargetDevice,
   setTargetDevice,
 } from "@/lib/hooks";
+import { useSrsSummary } from "@/lib/srs-hooks";
 import type { AppEvent } from "@/lib/types";
 
 const NAV = [
@@ -106,6 +107,21 @@ function QueueBadge() {
   return (
     <span className="ml-auto grid h-5 min-w-5 place-items-center rounded-full bg-brand px-1.5 text-[0.65rem] font-semibold text-white">
       {count}
+    </span>
+  );
+}
+
+/** Learning + review cards waiting right now — same pattern as `QueueBadge`. */
+function StudyBadge() {
+  const { data } = useSrsSummary();
+  const count = (data?.due_learning ?? 0) + (data?.due_review ?? 0);
+  if (count === 0) return null;
+  return (
+    <span
+      className="ml-auto grid h-5 min-w-5 place-items-center rounded-full bg-brand px-1.5 text-[0.65rem] font-semibold text-white"
+      title={`${data?.due_learning ?? 0} learning · ${data?.due_review ?? 0} review due`}
+    >
+      {count > 99 ? "99+" : count}
     </span>
   );
 }
@@ -196,7 +212,19 @@ function NotificationBell() {
   );
 }
 
-export function AppShell({ children }: { children: ReactNode }) {
+/**
+ * `chromeless` (set by `App.tsx` for `/study/review`, design §8.1) hides the
+ * mobile `h-14` header and drops the `pt-20`/`pb-20` content padding so a
+ * sticky rating bar can sit at the bottom edge of the viewport. The desktop
+ * sidebar stays — it never overlaps the content column.
+ */
+export function AppShell({
+  children,
+  chromeless = false,
+}: {
+  children: ReactNode;
+  chromeless?: boolean;
+}) {
   return (
     <div className="flex min-h-screen">
       {/* Fixed sidebar */}
@@ -239,6 +267,7 @@ export function AppShell({ children }: { children: ReactNode }) {
                   />
                   {label}
                   {label === "Queue" && <QueueBadge />}
+                  {label === "Study" && <StudyBadge />}
                 </>
               )}
             </NavLink>
@@ -250,8 +279,13 @@ export function AppShell({ children }: { children: ReactNode }) {
         </div>
       </aside>
 
-      {/* Mobile top bar */}
-      <header className="fixed inset-x-0 top-0 z-40 flex h-14 items-center gap-2 border-b border-border bg-bg-elevated/90 px-4 backdrop-blur-xl md:hidden">
+      {/* Mobile top bar (hidden on chromeless routes) */}
+      <header
+        className={cn(
+          "fixed inset-x-0 top-0 z-40 flex h-14 items-center gap-2 border-b border-border bg-bg-elevated/90 px-4 backdrop-blur-xl md:hidden",
+          chromeless && "hidden",
+        )}
+      >
         <div className="grid size-7 place-items-center rounded-lg bg-gradient-to-br from-brand-bright to-brand-dim">
           <Sparkles className="size-4 text-white" />
         </div>
@@ -279,8 +313,17 @@ export function AppShell({ children }: { children: ReactNode }) {
       </header>
 
       {/* Main content */}
-      <main className="flex-1 md:pl-60">
-        <div className="mx-auto max-w-[1500px] px-5 pb-20 pt-20 md:px-8 md:pt-8">{children}</div>
+      <main className="min-w-0 flex-1 md:pl-60">
+        <div
+          className={cn(
+            "mx-auto max-w-[1500px]",
+            chromeless
+              ? "min-h-screen px-4 md:px-6"
+              : "px-5 pb-20 pt-20 md:px-8 md:pt-8",
+          )}
+        >
+          {children}
+        </div>
       </main>
     </div>
   );

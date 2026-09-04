@@ -12,8 +12,9 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 import urllib.parse
-from typing import Optional
+from typing import NamedTuple, Optional
 
 import feedparser
 import httpx
@@ -94,6 +95,29 @@ def _rss_url(query: str, category: str = "1_2", trusted: bool = True) -> str:
     return f"{NYAA_BASE}/?page=rss&q={q}&c={category}&f={f}"
 
 
+_RATE_LIMIT_BACKOFF_S = 1.5
+
+
+def _http_get(url: str) -> Optional[httpx.Response]:
+    """One nyaa GET; on 429 (nyaa rate-limits bursts, and a sequel's name ladder
+    is several requests at once) wait briefly and retry once. None on failure."""
+    for attempt in (0, 1):
+        try:
+            r = httpx.get(url, headers=_UA, timeout=20, follow_redirects=True)
+        except Exception as e:
+            log.warning("nyaa fetch failed (%s): %s", url, e)
+            return None
+        if r.status_code == 429 and attempt == 0:
+            log.info("nyaa rate-limited (%s); retrying in %.1fs", url, _RATE_LIMIT_BACKOFF_S)
+            time.sleep(_RATE_LIMIT_BACKOFF_S)
+            continue
+        if r.status_code >= 400:
+            log.warning("nyaa fetch failed (%s): HTTP %s", url, r.status_code)
+            return None
+        return r
+    return None
+
+
 def nyaa_search(
     query: str, category: str = "1_2", trusted: bool = True
 ) -> list[NyaaResult]:
@@ -103,17 +127,17 @@ def nyaa_search(
     Returns [] (never raises) if nyaa is unreachable.
     """
     url = _rss_url(query, category, trusted)
-    try:
-        r = httpx.get(url, headers=_UA, timeout=20, follow_redirects=True)
-        r.raise_for_status()
-    except Exception as e:
-        log.warning("nyaa RSS fetch failed (%s): %s", url, e)
+    r = _http_get(url)
+    if r is None:
         return _nyaa_search_html(query, category, trusted)
 
     feed = feedparser.parse(r.text)
     results = [_entry_to_result(e) for e in feed.entries]
-    if not results:
-        log.info("nyaa RSS empty for %r, trying HTML fallback", query)
+    if not results and (feed.bozo or not feed.feed):
+        # not a well-formed (empty) feed — nyaa served something else; scrape the
+        # HTML table instead. A well-formed empty feed IS the answer: re-asking via
+        # HTML doubled the latency of every miss (a sequel's name ladder has several).
+        log.info("nyaa RSS unreadable for %r, trying HTML fallback", query)
         return _nyaa_search_html(query, category, trusted)
     return results
 
@@ -129,11 +153,8 @@ def _nyaa_search_html(
 
     f = 2 if trusted else 0
     url = f"{NYAA_BASE}/?q={urllib.parse.quote(query)}&c={category}&f={f}"
-    try:
-        r = httpx.get(url, headers=_UA, timeout=20, follow_redirects=True)
-        r.raise_for_status()
-    except Exception as e:  # pragma: no cover
-        log.warning("nyaa HTML fetch failed: %s", e)
+    r = _http_get(url)
+    if r is None:
         return []
 
     out: list[NyaaResult] = []
@@ -414,9 +435,16 @@ def add_download(result: NyaaResult) -> Download:
     size_bytes = _parse_size_to_bytes(result.size)
 
     with cursor() as cx:
+        # 'completed' = torrent done, import (transcode) in flight — a second click
+        # then must NOT add a second row either: both rows would share ONE
+        # Transmission torrent, so cancelling either deletes the data under the
+        # other's import, and two imports of one file race (the first prunes the
+        # source under the second). Bounded (a transcode is ≤ 2 h) so a row
+        # stranded in 'completed' can't block re-downloading that release forever.
         dup = cx.execute(
-            "SELECT * FROM downloads WHERE state NOT IN "
-            "('completed','postprocessed','error','cancelled','pp_failed','lost') "
+            "SELECT * FROM downloads WHERE "
+            "(state NOT IN ('completed','postprocessed','error','cancelled','pp_failed','lost') "
+            " OR (state='completed' AND updated_at >= datetime('now','-2 hours'))) "
             "AND ((nyaa_id IS NOT NULL AND nyaa_id=?) OR (magnet IS NOT NULL AND magnet=?)) "
             "ORDER BY id DESC LIMIT 1",
             (result.nyaa_id, result.magnet),
@@ -472,6 +500,32 @@ def list_downloads() -> list[Download]:
 #  cancel should still try to remove it. 'lost' = torrent already gone.)
 _TERMINAL_STATES = {"completed", "postprocessed", "cancelled", "error", "lost"}
 
+# rows in these states still NEED their torrent's data on disk: the download is
+# running, or finished and waiting for / failed in import (retryable).
+_NEEDS_DATA_STATES = ("queued", "downloading", "completed", "pp_failed")
+
+
+def other_rows_needing_torrent(qbt_hash: Optional[str], exclude_id: Optional[int]) -> list[int]:
+    """Other download rows that still rely on this torrent (see _NEEDS_DATA_STATES).
+
+    The same release added twice yields two rows sharing ONE Transmission torrent
+    (Transmission de-duplicates by infohash); the torrent and its files must then
+    outlive both — removing it for one row deletes the data under the other's
+    import. Never raises."""
+    if not qbt_hash:
+        return []
+    try:
+        with cursor() as cx:
+            rows = cx.execute(
+                "SELECT id FROM downloads WHERE qbt_hash=? AND id IS NOT ? "
+                f"AND state IN ({','.join('?' * len(_NEEDS_DATA_STATES))}) ORDER BY id",
+                (qbt_hash, exclude_id, *_NEEDS_DATA_STATES),
+            ).fetchall()
+        return [r["id"] for r in rows]
+    except Exception as e:  # pragma: no cover
+        log.warning("other_rows_needing_torrent(%s) failed: %s", qbt_hash, e)
+        return []
+
 
 def cancel_download(download_id: int) -> dict:
     """Cancel a download: remove its torrent from Transmission (discarding any
@@ -490,11 +544,17 @@ def cancel_download(download_id: int) -> dict:
     torrent_removed = False
     reason = None
     if row["qbt_hash"] and row["state"] not in ("completed", "postprocessed"):
-        # only pull live/partial torrents; leave a finished torrent's data in place
-        res = remove_torrent(row["qbt_hash"], delete_data=True)
-        torrent_removed = bool(res.get("ok"))
-        if not res.get("ok"):
-            reason = res.get("reason")
+        others = other_rows_needing_torrent(row["qbt_hash"], download_id)
+        if others:
+            # the same torrent backs another row's download/import — leave it be
+            reason = f"torrent shared with download {others[0]} — left in place"
+            log.info("cancel_download %s: %s", download_id, reason)
+        else:
+            # only pull live/partial torrents; leave a finished torrent's data in place
+            res = remove_torrent(row["qbt_hash"], delete_data=True)
+            torrent_removed = bool(res.get("ok"))
+            if not res.get("ok"):
+                reason = res.get("reason")
 
     with cursor() as cx:
         cx.execute(
@@ -584,6 +644,9 @@ def release_torrent(download_id: Optional[int]) -> dict:
         return {"ok": False, "reason": str(e)}
     if not row or not row["qbt_hash"]:
         return {"ok": True, "reason": "no torrent hash"}
+    others = other_rows_needing_torrent(row["qbt_hash"], download_id)
+    if others:
+        return {"ok": True, "reason": f"torrent shared with download {others[0]} — kept"}
     return remove_torrent(row["qbt_hash"], delete_data=False)
 
 
@@ -625,6 +688,195 @@ def _title_season_ordinal(name: Optional[str]) -> int:
         return 1
 
 
+def title_season_ordinal(*names: Optional[str]) -> int:
+    """Season a title refers to, considering EVERY name it goes by.
+
+    Never read the ordinal off a single name. AniList's romaji and english
+    routinely disagree about whether the season is stated at all, in both
+    directions: a sequel's romaji is often the Japanese arc name with no
+    ordinal ("EXAMPLE: Kami no Shiken-hen") while the
+    english spells it out ("… Season 2") — and just as often the reverse
+    ("… 2nd Season" vs a bare "… 2", which does not parse as a season at all).
+    Reading `romaji or english` therefore silently returns 1 for a sequel, and
+    every file correctly tagged S02 gets rejected as "different season".
+
+    Taking the highest ordinal any name states is what makes both readable.
+    """
+    return max((_title_season_ordinal(n) for n in names), default=1)
+
+
+# --------------------------------------------------------------------------- #
+# show names → nyaa queries
+#
+# nyaa matches EVERY word of a query, so a query is only as good as its least-
+# shared word. AniList names carry things release groups drop or spell
+# differently: an arc subtitle ('… 4th Season 2-bu Ichi Shou' — Erai-raws
+# writes '1 Shou', SubsPlease writes nothing at all) and the season marker itself
+# ('4th Season' vs 'S4' vs 'Season 4'). Querying the exact AniList name therefore
+# finds nothing for such a title — on every episode.
+# --------------------------------------------------------------------------- #
+
+# a season marker inside a show's NAME: "4th Season", "Season 4", "S4" / "S04"
+_SEASON_MARK_RE = re.compile(
+    r"\s*(?:[:\-–]\s*)?\b(?:(\d{1,2})(?:st|nd|rd|th)\s+Season|Season\s+(\d{1,2})|S(\d{1,2}))\b",
+    re.I,
+)
+# a tail that DISAMBIGUATES ("Part 2", "Cour 2") — kept in queries, never stripped
+_PART_TAIL_RE = re.compile(r"^(?:Part|Cour)\s*\d", re.I)
+# characters nyaa's query parser reads as SYNTAX (field ':', regex '/', NOT '!' and a
+# leading '-', ranges '[]{}', grouping / OR / AND '()|+', boost / fuzzy '^~',
+# wildcards '?*'). A name containing one silently matches nothing — 'Re:Example kara
+# Hajimeru Isekai Seikatsu 3rd Season 01' → 0 results, 'Re Example …' → hits. nyaa's
+# own tokenizer drops them from release titles anyway, so spaces lose nothing.
+_QUERY_SYNTAX_RE = re.compile(r"[:/!?\[\]{}^~\\*+|()]|(?<!\S)-|-(?!\S)")
+_SEARCH_WORKERS = 4  # nyaa 429s on bigger bursts
+
+
+def _query_text(name: str) -> str:
+    """A show name as plain nyaa query words: syntax characters become spaces."""
+    return " ".join(_QUERY_SYNTAX_RE.sub(" ", name or "").split())
+
+
+def _marked_season(title: Optional[str]) -> Optional[int]:
+    """Season a RELEASE title states in plain text ('4th Season', 'Season 04', 'S4'),
+    for when anitopy drops it — its season detection derails on a subtitle with
+    digits ('… 4th Season: 2-bu 1 Shou - 01' parses as no season at all,
+    which both hid that release from the S4 page and offered it on the S1 page).
+    None when the title carries no marker. Only consulted after anitopy."""
+    m = _SEASON_MARK_RE.search(title or "")
+    if not m:
+        return None
+    return int(next(g for g in m.groups() if g))
+
+
+def _split_season_marker(name: Optional[str]) -> Optional[tuple[str, int, str]]:
+    """(base, season, tail) around the season marker in a name, or None.
+
+    'Example Gakuen Monogatari e 4th Season 2-bu Ichi Shou'
+        → ('Example Gakuen Monogatari e', 4, '2-bu Ichi Shou')
+    """
+    m = _SEASON_MARK_RE.search(name or "")
+    if not m:
+        return None
+    base = (name or "")[: m.start()].strip(" :-–")
+    if not base:
+        return None
+    season = int(next(g for g in m.groups() if g))
+    tail = (name or "")[m.end():].strip(" :-–")
+    return base, season, tail
+
+
+def _ordinal(n: int) -> str:
+    suffix = "th" if 10 <= n % 100 <= 20 else {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
+    return f"{n}{suffix}"
+
+
+class _Names(NamedTuple):
+    exact: list[str]    # the AniList names verbatim (romaji, english) — what always worked
+    derived: list[str]  # sequels: base + each season spelling groups use
+    bare: list[str]     # base alone — last resort; relies on the season gate
+
+
+def _search_names(title: str, alt: Optional[str] = None) -> _Names:
+    """Show names to query nyaa with, most specific first (see the section note).
+
+    A plain (season-1, no-marker) title yields ONLY its exact names — unchanged
+    behaviour. A sequel additionally yields `Base S4`, `Base "4th Season"` and
+    `Base "Season 4"` (quoted = nyaa phrase), minus any spelling that equals an
+    exact name. A disambiguating 'Part N' tail is kept in every derived query —
+    a Part-2 season's `Base S2` would otherwise match Part 1's files.
+    """
+    exact: list[str] = []
+    derived: list[str] = []
+    bare: list[str] = []
+    keys: set = set()
+
+    def _add(bucket: list[str], q: str) -> None:
+        q = _query_text(q)  # keeps the '"…"' phrase quotes the marks below add
+        key = q.replace('"', "").lower()
+        if q and key not in keys:
+            keys.add(key)
+            bucket.append(q)
+
+    for name in (title, alt):
+        if name:
+            _add(exact, name)
+    for name in (title, alt):
+        split = _split_season_marker(name)
+        if not split:
+            continue
+        base, season, tail = split
+        keep = f" {tail}" if tail and _PART_TAIL_RE.match(tail) else ""
+        for mark in (f"S{season}", f'"{_ordinal(season)} Season"', f'"Season {season}"'):
+            _add(derived, f"{base} {mark}{keep}")
+        _add(bare, f"{base}{keep}")
+    return _Names(exact, derived, bare)
+
+
+def _release_noise_patterns(*names: Optional[str]) -> list[re.Pattern]:
+    """Regexes that drop a show's DECORATIVE season tail (the arc subtitle after the
+    season marker) from a release title before anitopy parses it.
+
+    anitopy reads '… 4th Season: 2-bu 1 Shou - 01' as a title with no
+    season at all (the subtitle's digits derail it), so the release fails the
+    season gate. With the tail removed it parses as S4 E01. Matching tolerates
+    the separators groups vary ('2-bu 1 Shou' / '2 Bu 1 Shou').
+    'Part N' tails are not noise and are left alone.
+    """
+    pats: list[re.Pattern] = []
+    seen: set = set()
+    for name in names:
+        split = _split_season_marker(name)
+        if not split:
+            continue
+        tail = split[2]
+        if not tail or _PART_TAIL_RE.match(tail):
+            continue
+        words = [w for w in re.split(r"[\s:\-–_]+", tail) if w]
+        key = " ".join(words).lower()
+        if len(key) < 3 or key in seen:
+            continue
+        seen.add(key)
+        body = r"[\s\-–_]+".join(re.escape(w) for w in words)
+        pats.append(re.compile(r"\s*[:\-–]?\s*\b" + body + r"\b", re.I))
+    return pats
+
+
+def _clean_release_title(title: str, noise: list[re.Pattern]) -> str:
+    """The release title with the show's decorative tail removed (see above)."""
+    t = title or ""
+    if not noise:
+        return t
+    for pat in noise:
+        t = pat.sub(" ", t)
+    return " ".join(t.split())
+
+
+def _nyaa_search_many(
+    queries: list[str], category: str = "1_2", trusted: bool = False
+) -> list[tuple[str, list[NyaaResult]]]:
+    """Run several nyaa searches concurrently on a small pool, results in query
+    order (so de-duplication stays deterministic). A sequel needs a handful of
+    name spellings; the picker must not pay N× latency for them. Never raises."""
+    queries = list(dict.fromkeys(q for q in queries if q))
+    if not queries:
+        return []
+
+    def _one(q: str) -> list[NyaaResult]:
+        try:
+            return nyaa_search(q, category=category, trusted=trusted)
+        except Exception as e:  # nyaa_search already never raises; belt and braces
+            log.warning("nyaa search failed for %r: %s", q, e)
+            return []
+
+    if len(queries) == 1:
+        return [(queries[0], _one(queries[0]))]
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=min(_SEARCH_WORKERS, len(queries))) as ex:
+        results = list(ex.map(_one, queries))
+    return list(zip(queries, results))
+
+
 def _first_str(v) -> Optional[str]:
     """anitopy fields (video_resolution, release_group, …) may be a str OR a list.
     Coerce to a single string so downstream `.lower()` / Pydantic str fields are safe."""
@@ -647,13 +899,19 @@ def _episode_release_candidates(
         absolute (ep + Fribb offset), so a sequel's absolute-numbered releases
         still match.
     This stops a Season-4 'ep 6' release from being offered on the Season-1 page.
+
+    Queries go out as a ladder (`_search_names`): the exact AniList names plus,
+    for a sequel, the base title with each season spelling groups use; the bare
+    base only when those found nothing. Release titles are stripped of the
+    show's decorative arc subtitle before parsing (`_release_noise_patterns`) so
+    the season gate reads the season groups actually tagged.
     """
     try:
         import anitopy  # noqa: F401
     except Exception:  # pragma: no cover
         pass
 
-    target_season = max(_title_season_ordinal(title), _title_season_ordinal(alt))
+    target_season = title_season_ordinal(title, alt)
     abs_eps: set = set()
     if anilist_id is not None:
         try:
@@ -662,34 +920,46 @@ def _episode_release_candidates(
         except Exception:
             abs_eps = set()
 
-    queries = [f"{title} {ep:02d}"]
-    if alt and alt != title:
-        queries.append(f"{alt} {ep:02d}")
+    names = _search_names(title, alt)
+    noise = _release_noise_patterns(title, alt)
 
     cands: list[tuple[NyaaResult, dict]] = []
     seen: set = set()
-    for q in queries:
-        for r in nyaa_search(q, category="1_2", trusted=False):
-            if not (r.magnet or r.torrent_url):
-                continue
-            key = r.nyaa_id or r.title
-            if key in seen:
-                continue
-            seen.add(key)
-            try:
-                import anitopy
-                parsed = anitopy.parse(r.title) or {}
-            except Exception:
-                parsed = {}
-            epn = _parsed_ep(parsed)
-            rseason = _parsed_season(parsed)
-            # relative: same episode number AND same season (unmarked == S1)
-            rel_ok = epn == ep and (rseason or 1) == target_season
-            # absolute cross-season numbering: unmarked season + offset-shifted number
-            abs_ok = rseason is None and epn in abs_eps
-            if not (rel_ok or abs_ok):
-                continue
-            cands.append((r, parsed))
+
+    def _collect(queries: list[str]) -> None:
+        for _q, results in _nyaa_search_many(queries, category="1_2", trusted=False):
+            for r in results:
+                if not (r.magnet or r.torrent_url):
+                    continue
+                key = r.nyaa_id or r.title
+                if key in seen:
+                    continue
+                seen.add(key)
+                try:
+                    import anitopy
+                    parsed = anitopy.parse(_clean_release_title(r.title, noise)) or {}
+                except Exception:
+                    parsed = {}
+                epn = _parsed_ep(parsed)
+                rseason = _parsed_season(parsed)
+                if rseason is None:
+                    rseason = _marked_season(r.title)
+                # relative: same episode number AND same season (unmarked == S1)
+                rel_ok = epn == ep and (rseason or 1) == target_season
+                # absolute cross-season numbering: unmarked season + offset-shifted number
+                abs_ok = rseason is None and epn in abs_eps
+                if not (rel_ok or abs_ok):
+                    continue
+                cands.append((r, parsed))
+
+    primary = [f"{n} {ep:02d}" for n in names.exact + names.derived]
+    # absolute-numbered releases ('Example Series - 15' for S2 ep 3) carry no season, so
+    # only the bare base + THAT number finds them — the gate alone can't surface
+    # what was never asked for.
+    primary += [f"{n} {a:02d}" for a in sorted(abs_eps) for n in (names.bare or names.exact)]
+    _collect(primary)
+    if not cands and names.bare:
+        _collect([f"{n} {ep:02d}" for n in names.bare])
 
     def _score(item):
         r, p = item
@@ -919,6 +1189,26 @@ _MULTISEASON_RE = re.compile(
     r"|\d\s*[-+~&]\s*\d(?:st|nd|rd|th)?\s*seasons?)\b",        # 1+2 Season
     re.I,
 )
+# the numeric span of a multi-season pack ("Season 1-3", "S1+S2", "1+2 Season")
+_SEASON_SPAN_RE = re.compile(
+    r"\bs(\d{1,2})\s*[-+~&]\s*s(\d{1,2})\b"
+    r"|\bseasons?\s*(\d{1,2})\s*[-+~&]\s*(?:season\s*)?(\d{1,2})\b"
+    r"|\b(\d{1,2})\s*[-+~&]\s*(\d{1,2})(?:st|nd|rd|th)?\s*seasons?\b",
+    re.I,
+)
+
+
+def _multiseason_span(title: str) -> Optional[tuple[int, int]]:
+    """(first, last) season of a multi-season pack when its title states the
+    range ('Season 1-3' → (1, 3)); None for 'Complete' packs or single seasons.
+    A pack that names its seasons does NOT contain a season outside that range."""
+    m = _SEASON_SPAN_RE.search(title or "")
+    if not m:
+        return None
+    nums = [int(g) for g in m.groups() if g]
+    if len(nums) != 2 or nums[0] > nums[1]:
+        return None
+    return nums[0], nums[1]
 
 
 def _looks_like_batch(title: str, parsed: dict) -> bool:
@@ -949,6 +1239,9 @@ def _episode_span(
 ) -> tuple[Optional[str], Optional[int]]:
     """Best-effort (span_label, episode_count) for a batch, for UI display."""
     t = title or ""
+    seasons = _multiseason_span(t)
+    if seasons:  # 'Season 1-3' is a season range, not episodes 1–3
+        return (f"S{seasons[0]}–S{seasons[1]}", None)
     m = _RANGE_RE.search(t)
     if m:
         a, b = int(m.group(1)), int(m.group(2))
@@ -980,42 +1273,60 @@ def _batch_release_candidates(
     queries carry NO episode number, so batch torrents actually surface; results
     are then gated to packs (`_looks_like_batch`) of this season.
     """
-    target_season = max(_title_season_ordinal(title), _title_season_ordinal(alt))
+    target_season = title_season_ordinal(title, alt)
+    names = _search_names(title, alt)
+    noise = _release_noise_patterns(title, alt)
 
+    # The exact names keep their full suffix set (as before). The derived season
+    # spellings get the two that surface packs, and the bare base only ' batch' —
+    # pack names vary the most ('S4 (01-16) [Batch]', '(Season 04) … (Batch)'), so
+    # for packs the bare base is worth asking up front, not as a fallback; a bare
+    # base ALONE would just return every season's single episodes.
     queries: list[str] = []
-    for base in (title, alt):
-        if not base:
-            continue
-        for q in (f"{base} batch", f"{base} BD 1080p", f"{base} 1080p", base):
-            if q not in queries:
-                queries.append(q)
+
+    def _add_queries(show_names: list[str], suffixes: tuple[str, ...]) -> None:
+        for base in show_names:
+            for suffix in suffixes:
+                q = f"{base}{suffix}"
+                if q not in queries:
+                    queries.append(q)
+
+    _add_queries(names.exact, (" batch", " BD 1080p", " 1080p", ""))
+    _add_queries(names.derived, (" batch", ""))
+    _add_queries(names.bare, (" batch",))
 
     cands: list[tuple[NyaaResult, dict, tuple]] = []
     seen: set = set()
-    for q in queries:
-        for r in nyaa_search(q, category="1_2", trusted=False):
+    for _q, results in _nyaa_search_many(queries, category="1_2", trusted=False):
+        for r in results:
             if not (r.magnet or r.torrent_url):
                 continue
             key = r.nyaa_id or r.title
             if key in seen:
                 continue
+            clean_title = _clean_release_title(r.title, noise)
             try:
                 import anitopy
-                parsed = anitopy.parse(r.title) or {}
+                parsed = anitopy.parse(clean_title) or {}
             except Exception:
                 parsed = {}
-            if not _looks_like_batch(r.title, parsed):
+            if not _looks_like_batch(clean_title, parsed):
                 continue
             # season gate: accept unmarked / this-season / multi-season (complete);
-            # reject a *different single season's* pack (e.g. an S2-only BD on S1).
+            # reject a *different single season's* pack (e.g. an S2-only BD on S1)
+            # and a multi-season pack whose stated range excludes this season
+            # (a 'Season 1-3' pack is not a Season 4 pack).
             # Fall back to the title text when anitopy doesn't tag a season.
             rseason = _parsed_season(parsed)
             if rseason is None:
-                ts = _title_season_ordinal(r.title)
-                rseason = ts if ts != 1 else None  # 1 == "unmarked" here, keep lenient
-            multi = bool(_MULTISEASON_RE.search(r.title or ""))
+                rseason = _marked_season(clean_title)  # None == unmarked, keep lenient
+            multi = bool(_MULTISEASON_RE.search(clean_title))
             if rseason is not None and rseason != target_season and not multi:
                 continue
+            if multi:
+                span = _multiseason_span(clean_title)
+                if span and not (span[0] <= target_season <= span[1]):
+                    continue
             seen.add(key)
             cands.append((r, parsed, _episode_span(r.title, parsed, total_episodes)))
 
@@ -1151,7 +1462,7 @@ def download_batch(
     if not (chosen and (chosen.magnet or chosen.torrent_url)):
         return {"ok": False, "reason": "release has no magnet/torrent link"}
 
-    season = _title_season_ordinal(row["romaji"] or row["english"])
+    season = title_season_ordinal(row["romaji"], row["english"])
     total = episode_count or row["total_episodes"]
 
     wanted: Optional[list] = None
@@ -1342,7 +1653,7 @@ def handle_select_files(payload: dict) -> None:
         ).fetchone()
     if tr:
         total = tr["total_episodes"]
-        target_season = _title_season_ordinal(tr["romaji"] or tr["english"])
+        target_season = title_season_ordinal(tr["romaji"], tr["english"])
 
     unwanted = []
     for f in files:
@@ -1412,9 +1723,10 @@ def follow_title(anilist_id: int, resolution: str = "1080p") -> RssFollow:
         ).fetchone()
         if existing:
             return _follow_row_to_model(existing)
-    # romaji matches fansub-group naming best; fall back to english.
+    # romaji matches fansub-group naming best; fall back to english. Query SYNTAX
+    # characters (':' in 'Re:Example') would make the feed match nothing.
     name = t["romaji"] or t["english"] or ""
-    query = name.strip()
+    query = _query_text(name.strip())
     return add_follow(
         query=query, title=name or None, anilist_id=anilist_id,
         resolution=resolution,
@@ -1605,7 +1917,13 @@ def poll_downloads() -> dict:
         _MISS_COUNTS.pop(row["id"], None)
         progress = info.get("progress", 0.0)
         qstate = info.get("state", "")
-        is_done = qstate in _COMPLETE_STATES or progress >= 0.999
+        # Complete means EVERY wanted byte is on disk: Transmission reports
+        # percentDone == 1.0 exactly then (and flips to seeding, or stops under
+        # our ratio-0 policy). 99.9% is NOT complete — the endgame's last pieces
+        # can take minutes, and until a file is whole it is still 'name.part',
+        # which the importer rightly does not see: a pack declared done at
+        # 0.999 imported nothing.
+        is_done = qstate in _COMPLETE_STATES or progress >= 1.0
 
         new_state = "completed" if is_done else "downloading"
         save_path = _completed_save_path(info, row["save_path"]) if is_done else row["save_path"]

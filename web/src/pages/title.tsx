@@ -323,6 +323,11 @@ function EpisodeRow({
   const state = ep.download_state?.toLowerCase() ?? null;
   const failed = isFailedState(state);
   const downloading = state === "downloading" || state === "queued";
+  // torrent done, episode not in the library yet: the import (an HEVC→MP4
+  // transcode, minutes) is running. Without this the row fell through to the
+  // Download button again — "downloaded, but nothing appeared" — and a second
+  // click added a duplicate download of the same file.
+  const importing = !ep.video_path && state === "completed";
   const dlPct = dl ? Math.round((dl.progress ?? 0) * 100) : null;
 
   const markUpToHere = () => {
@@ -498,6 +503,14 @@ function EpisodeRow({
                 Play in browser
               </Button>
             )
+          ) : importing ? (
+            <span
+              className="inline-flex items-center gap-1.5 rounded-lg border border-brand/30 bg-brand/10 px-2.5 py-1.5 text-xs text-brand-bright"
+              title="Downloaded — converting to a browser-playable MP4 (a 1080p HEVC episode takes ~5 min). The Play button appears here when it finishes."
+            >
+              <Loader2 className="size-3.5 animate-spin" />
+              Importing…
+            </span>
           ) : downloading ? (
             <span className="inline-flex items-center gap-1.5 rounded-lg border border-border-strong bg-surface py-1.5 pl-2.5 pr-1 text-xs text-muted">
               <Loader2 className="size-3.5 animate-spin" />

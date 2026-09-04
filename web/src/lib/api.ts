@@ -37,17 +37,31 @@ import type {
   TranslateResult,
 } from "./types";
 
-export class ApiError extends Error {
+/**
+ * `body` carries the parsed JSON error payload when the server sent one, so a
+ * caller can read a typed conflict body (e.g. `SrsReviewConflict` on a 409 from
+ * `POST /srs/review`, `SrsCreateCardConflict` on `POST /srs/cards`) instead of
+ * re-parsing a string. Use the generic parameter at the call site:
+ * `(e as ApiError<SrsReviewConflict>).body?.card`.
+ */
+export class ApiError<B = unknown> extends Error {
   status: number;
   detail?: string;
-  constructor(status: number, message: string, detail?: string) {
+  body?: B;
+  constructor(status: number, message: string, detail?: string, body?: B) {
     super(message);
     this.status = status;
     this.detail = detail;
+    this.body = body;
   }
 }
 
-async function req<T>(
+/** Narrow an unknown error to a typed `ApiError` body (undefined when absent). */
+export function apiErrorBody<B>(e: unknown): B | undefined {
+  return e instanceof ApiError ? (e.body as B | undefined) : undefined;
+}
+
+export async function req<T>(
   path: string,
   init?: RequestInit & { json?: unknown },
 ): Promise<T> {
@@ -61,13 +75,15 @@ async function req<T>(
   const res = await fetch(`/api${path}`, { ...rest, headers, body });
   if (!res.ok) {
     let detail: string | undefined;
+    let errBody: unknown;
     try {
       const data = await res.json();
+      errBody = data;
       detail = typeof data?.detail === "string" ? data.detail : JSON.stringify(data?.detail);
     } catch {
       /* ignore */
     }
-    throw new ApiError(res.status, detail || `${res.status} ${res.statusText}`, detail);
+    throw new ApiError(res.status, detail || `${res.status} ${res.statusText}`, detail, errBody);
   }
   if (res.status === 204) return undefined as T;
   const ct = res.headers.get("content-type") ?? "";
@@ -88,29 +104,6 @@ export function saveBlob(blob: Blob, filename: string) {
   a.download = filename;
   a.click();
   URL.revokeObjectURL(url);
-}
-
-/**
- * Binary .apkg export — bypasses `req<T>` (the response is a file, not JSON)
- * and hands the blob straight to the browser as a download.
- */
-export async function exportApkg(lineIds: number[], deck = "Mimi Lab"): Promise<void> {
-  const res = await fetch(`/api/learn/anki/export.apkg?deck=${encodeURIComponent(deck)}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ line_ids: lineIds }),
-  });
-  if (!res.ok) {
-    let detail: string | undefined;
-    try {
-      const data = await res.json();
-      detail = typeof data?.detail === "string" ? data.detail : undefined;
-    } catch {
-      /* ignore */
-    }
-    throw new ApiError(res.status, detail || `${res.status} ${res.statusText}`, detail);
-  }
-  saveBlob(await res.blob(), `${deck.replace(/[\\/:*?"<>|]+/g, "_")}.apkg`);
 }
 
 export const api = {
@@ -210,10 +203,6 @@ export const api = {
     req<SweetSpotItem[]>(
       `/learn/sweet-spot?lo=${lo}&hi=${hi}&limit=${limit}&include_watched=${includeWatched}`,
     ),
-
-  // ── Anki export (Moments sentence bank → TSV) ────────────
-  ankiExport: (lineIds: number[]) =>
-    req<string>("/learn/anki/export", { method: "POST", json: { line_ids: lineIds } }),
 
   // ── Acquire ──────────────────────────────────────────────
   acquireSearch: (q: string, trusted = true) =>

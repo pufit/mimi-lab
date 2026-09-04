@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { useSearchParams } from "react-router-dom";
+import { Link, useSearchParams } from "react-router-dom";
 import {
   MonitorPlay,
   BookMarked,
@@ -19,6 +19,8 @@ import {
   Sparkles,
   Stethoscope,
   FlaskConical,
+  GraduationCap,
+  ChevronRight,
 } from "lucide-react";
 import {
   useConnectorStatus,
@@ -97,8 +99,39 @@ export function SettingsPage() {
         <EnglishSubsCard />
         <MalCard />
         <PathsCard />
+        <StudyLinkCard />
       </div>
     </div>
+  );
+}
+
+/**
+ * The three study settings are inline on the Deck (design §8.9) — this card is
+ * only a signpost, deliberately not a second place to change them.
+ */
+function StudyLinkCard() {
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="flex items-center gap-2">
+          <GraduationCap className="size-4 text-brand-bright" />
+          Study
+        </CardTitle>
+        <CardDescription>
+          New cards per day, how quickly a missed word returns to the stack, and whether moments
+          may come from episodes you haven&apos;t watched — all live on the Deck, next to the
+          numbers they change.
+        </CardDescription>
+      </CardHeader>
+      <CardContent>
+        <Link to="/study">
+          <Button variant="secondary" size="sm">
+            Open the Deck
+            <ChevronRight className="size-3.5" />
+          </Button>
+        </Link>
+      </CardContent>
+    </Card>
   );
 }
 

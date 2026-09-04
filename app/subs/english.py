@@ -96,7 +96,7 @@ def _embedded_sidecar(ep: dict) -> Optional[Path]:
     legitimately rewrite. (The old heuristic — 'no subtitles row yet = the file
     is embedded' — silently discarded fresh extractions whenever an EN row
     predated the video, e.g. subs fetched at title-add time; the MT rebuild
-    then overwrote the release's own track. Mashle E01-E12, Aug 2026.)
+    then overwrote the release's own track. One show's E01-E12, Aug 2026.)
     Structure is still gate-validated on every acceptance, never trusted."""
     vp = ep.get("video_path")
     if not vp:

@@ -3,14 +3,18 @@
 Run after a deploy/restart:  .venv/bin/python integration_test.py
 (For the full relay/media/upload E2E with a fake Connector on a scratch DB,
 run `.venv/bin/python -m app.connector.selftest` instead.)
+
+Defaults to the deployed server on :8000. Point it at a dev instance with
+`MIMI_LAB_BASE_URL=http://127.0.0.1:8010 .venv/bin/python integration_test.py`.
 """
 from __future__ import annotations
 
+import os
 import sys
 
 import httpx
 
-BASE = "http://127.0.0.1:8000"
+BASE = os.environ.get("MIMI_LAB_BASE_URL", "http://127.0.0.1:8000").rstrip("/")
 results: list[tuple[str, bool]] = []
 
 
@@ -23,6 +27,10 @@ def check(name: str, cond, extra: str = "") -> bool:
 
 def get(path: str, timeout: float = 15.0):
     return httpx.get(BASE + path, timeout=timeout)
+
+
+def post(path: str, json_body=None, timeout: float = 15.0):
+    return httpx.post(BASE + path, json=json_body, timeout=timeout)
 
 
 def main() -> int:
@@ -84,6 +92,37 @@ def main() -> int:
     stats = r.json()
     check("stats", r.status_code == 200 and "known_series" in stats,
           f"watched={stats.get('watched_total')} known_pts={len(stats.get('known_series', []))}")
+
+    # --- SRS (SRS_DESIGN §10.2) --------------------------------------------
+    r = get("/api/srs/summary")
+    summary = r.json() if r.status_code == 200 else {}
+    check("srs summary", r.status_code == 200 and "states" in summary,
+          f"due={summary.get('due_learning')}+{summary.get('due_review')} "
+          f"new={summary.get('new_stack_total')}")
+    check("srs summary states zero-filled", len(summary.get("states", {})) == 7,
+          f"states={summary.get('states')}")
+
+    r = get("/api/srs/queue?limit=1")
+    check("srs queue", r.status_code == 200 and "server_time" in r.json(),
+          f"cards={len(r.json().get('cards', []))}")
+
+    r = get("/api/srs/settings")
+    st = r.json() if r.status_code == 200 else {}
+    check("srs settings default demote_after_fails=2",
+          r.status_code == 200 and st.get("demote_after_fails") == 2, str(st))
+
+    r = get("/api/srs/candidates?limit=3")
+    check("srs candidates", r.status_code == 200 and isinstance(r.json().get("items"), list),
+          f"total={r.json().get('total')}")
+
+    r = get("/api/srs/cards?limit=1")
+    check("srs cards list", r.status_code == 200 and isinstance(r.json().get("items"), list),
+          f"total={r.json().get('total')}")
+
+    # the Anki export is retired: the route was a POST, so a POST must 404
+    # (a GET would 405 against a still-present route and prove nothing).
+    r = post("/api/learn/anki/export", {"line_ids": []})
+    check("anki export retired (404)", r.status_code == 404, f"status={r.status_code}")
 
     r = get("/api/connector/status")
     check("connector status", r.status_code == 200 and "connected" in r.json(),

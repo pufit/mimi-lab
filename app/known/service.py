@@ -87,6 +87,14 @@ def upload_known_words(rows: list[dict]) -> dict:
             enqueue("comprehension_recompute_all", {})  # deduped; one bulk pass
         except Exception as e:  # pragma: no cover
             log.warning("could not enqueue re-rank after known sync: %s", e)
+    # SRS reconcile runs UNCONDITIONALLY (SRS_DESIGN §9.3): `changed` only
+    # reflects a KNOWN-count move, so an IGNORED-only or net-zero push would
+    # otherwise wait for the daily backstop. Dedup makes a repeat free.
+    try:
+        from ..jobs.service import enqueue
+        enqueue("srs_reconcile", {}, priority=30)
+    except Exception as e:  # pragma: no cover
+        log.warning("could not enqueue srs reconcile after known sync: %s", e)
     return {"written": written, "removed": removed, "counts": counts}
 
 

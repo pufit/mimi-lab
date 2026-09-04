@@ -1,5 +1,5 @@
 import { type ReactNode } from "react";
-import { Routes, Route, useLocation } from "react-router-dom";
+import { Routes, Route, matchPath, useLocation } from "react-router-dom";
 import { usePageTitle, useServerEvents } from "./lib/hooks";
 import { AppShell } from "./components/layout/app-shell";
 import { ErrorBoundary } from "./components/error-boundary";
@@ -7,6 +7,10 @@ import { LibraryPage } from "./pages/library";
 import { TitlePage } from "./pages/title";
 import { NextPage } from "./pages/next";
 import { StudyPage } from "./pages/study";
+import { ReviewPage } from "./pages/study-review";
+import { StackPage } from "./pages/study-stack";
+import { CardDetailPage } from "./pages/study-card";
+import { StudyStatsPage } from "./pages/study-stats";
 import { MomentsPage } from "./pages/moments";
 import { StatsPage } from "./pages/stats";
 import { TranscriptPage } from "./pages/transcript";
@@ -27,10 +31,19 @@ function RouteBoundary({ title, children }: { title: string; children: ReactNode
   return <ErrorBoundary key={pathname}>{children}</ErrorBoundary>;
 }
 
-const ROUTES: { path: string; title: string; el: ReactNode }[] = [
+/**
+ * `chromeless` routes render without the mobile top bar and without the
+ * `pt-20`/`pb-20` content padding, so a sticky bottom bar (the review rating
+ * buttons) can sit flush against the viewport edge (design §8.1).
+ */
+const ROUTES: { path: string; title: string; el: ReactNode; chromeless?: boolean }[] = [
   { path: "/", title: "Library", el: <LibraryPage /> },
   { path: "/next", title: "Watch next", el: <NextPage /> },
   { path: "/study", title: "Study", el: <StudyPage /> },
+  { path: "/study/review", title: "Review", el: <ReviewPage />, chromeless: true },
+  { path: "/study/stack", title: "Stack", el: <StackPage /> },
+  { path: "/study/cards/:id", title: "Card", el: <CardDetailPage /> },
+  { path: "/study/stats", title: "Study stats", el: <StudyStatsPage /> },
   { path: "/title/:id", title: "Title", el: <TitlePage /> },
   { path: "/moments", title: "Moments", el: <MomentsPage /> },
   { path: "/stats", title: "Stats", el: <StatsPage /> },
@@ -44,10 +57,12 @@ const ROUTES: { path: string; title: string; el: ReactNode }[] = [
 
 export function App() {
   useServerEvents(); // one live SSE connection → invalidate queries on push
+  const { pathname } = useLocation();
+  const chromeless = ROUTES.some((r) => r.chromeless && matchPath(r.path, pathname) !== null);
   return (
     <>
       <div className="app-aurora" />
-      <AppShell>
+      <AppShell chromeless={chromeless}>
         <Routes>
           {ROUTES.map((r) => (
             <Route

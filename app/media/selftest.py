@@ -106,6 +106,104 @@ def test_safe_title() -> None:
         not any(c in s for c in '<>:"/\\|?*'), s)
 
 
+def _scratch_db_ready() -> bool:
+    """True when MIMI_LAB_DB points at a scratch database (schema created here).
+    Never touch the live DB from a selftest (a selftest once wiped live creds)."""
+    import os
+    from ..db import init_db
+
+    live = (ROOT / "data" / "mimi_lab.db").resolve()
+    if not os.environ.get("MIMI_LAB_DB") or Path(settings.mimi_lab_db).resolve() == live:
+        return False
+    init_db()
+    return True
+
+
+def test_partial_wait(tmp: Path) -> None:
+    """Scratch-DB: a download whose files are still 'name.part' is not failed —
+    the import waits and re-checks; a genuinely empty pack fails VISIBLY.
+
+    Transmission renames an in-progress file only when every byte is in, and a
+    torrent can read complete a beat before that (a pack declared done at 99.9%
+    had all three wanted files still .part). The batch importer used to return
+    quietly on 'no video files' and the pack was never imported."""
+    print("\n# import waits on .part files; empty packs fail visibly (scratch DB)")
+    d = tmp / "pack"
+    d.mkdir()
+    (d / "Example Series - 01.mkv.part").write_bytes(b"x")
+    _ok("_has_partial_files: folder holding a .part", service._has_partial_files(d))
+    _ok("_has_partial_files: the file path itself still .part",
+        service._has_partial_files(d / "Example Series - 01.mkv"))
+    empty = tmp / "empty"
+    empty.mkdir()
+    _ok("_has_partial_files: nothing in progress", not service._has_partial_files(empty))
+
+    if not _scratch_db_ready():
+        print("  [SKIP] set MIMI_LAB_DB to a scratch path to run the DB-backed checks")
+        return
+    from ..db import cursor
+
+    with cursor() as cx:
+        cx.execute("DELETE FROM downloads")
+        cx.execute("DELETE FROM jobs")
+        cx.execute("DELETE FROM events")
+        cx.execute("INSERT OR REPLACE INTO titles(anilist_id, romaji, english, total_episodes) "
+                   "VALUES(999, 'Example Series', 'Example Series', 3)")
+        cx.execute("INSERT INTO downloads(id,kind,state,save_path,anilist_id,wanted_eps) "
+                   "VALUES(7,'batch','completed',?,999,'[1, 2]')", (str(d),))
+        cx.execute("INSERT INTO downloads(id,kind,state,save_path,anilist_id,wanted_eps) "
+                   "VALUES(8,'batch','completed',?,999,'[1, 2]')", (str(empty),))
+        cx.execute("INSERT INTO downloads(id,kind,state,save_path,anilist_id) "
+                   "VALUES(9,'single','completed',?,999)", (str(d / "Example Series - 01.mkv"),))
+        cx.execute("INSERT INTO downloads(id,kind,state,save_path,anilist_id) "
+                   "VALUES(10,'single','completed',?,999)", (str(tmp / "nothing.mkv"),))
+    try:
+        res = service._postprocess_batch(7, str(d), 999, 0)
+        with cursor() as cx:
+            job = cx.execute("SELECT payload_json FROM jobs WHERE type='postprocess'").fetchone()
+        _ok("pack with only .part files: waits + re-checks",
+            res.get("ok") and res.get("waiting") and job is not None
+            and '"pp_attempt": 1' in (job["payload_json"] if job else ""), f"{res} job={dict(job) if job else None}")
+
+        res2 = service._postprocess_batch(8, str(empty), 999, 0)
+        with cursor() as cx:
+            st = cx.execute("SELECT state FROM downloads WHERE id=8").fetchone()["state"]
+            ev = cx.execute("SELECT title FROM events WHERE title LIKE 'Season pack: nothing%'").fetchone()
+        _ok("empty pack: fails visibly (pp_failed + warning event)",
+            res2.get("error") and st == "pp_failed" and ev is not None, f"state={st} event={ev and ev['title']}")
+
+        res3 = service.postprocess({"download_id": 9})
+        _ok("single episode still .part: waits + re-checks", res3.get("ok") and res3.get("waiting"), f"{res3}")
+
+        raised = None
+        try:
+            service.postprocess({"download_id": 10})
+        except Exception as e:
+            raised = e
+        with cursor() as cx:
+            st10 = cx.execute("SELECT state FROM downloads WHERE id=10").fetchone()["state"]
+        _ok("single with nothing on disk: fails (pp_failed) as before",
+            isinstance(raised, RuntimeError) and st10 == "pp_failed", f"{raised!r} state={st10}")
+
+        with cursor() as cx:
+            cx.execute("INSERT INTO downloads(id,kind,state,save_path,qbt_hash) VALUES(11,'single','completed',?, 'hh')",
+                       (str(d / "x.mkv"),))
+            cx.execute("INSERT INTO downloads(id,kind,state,save_path,qbt_hash) VALUES(12,'single','completed',?, 'hh')",
+                       (str(d / "x.mkv"),))
+        others = service._other_rows_needing_source(11, "hh", d / "x.mkv")
+        _ok("source kept while another row's import still needs it", others == [12], f"{others}")
+        with cursor() as cx:
+            cx.execute("UPDATE downloads SET state='postprocessed' WHERE id=12")
+        _ok("…and pruned once that import is done",
+            service._other_rows_needing_source(11, "hh", d / "x.mkv") == [])
+    finally:
+        with cursor() as cx:
+            cx.execute("DELETE FROM downloads")
+            cx.execute("DELETE FROM jobs")
+            cx.execute("DELETE FROM events")
+            cx.execute("DELETE FROM titles WHERE anilist_id=999")
+
+
 def main() -> int:
     print("=" * 64)
     print("MEDIA SELFTEST")
@@ -119,6 +217,7 @@ def main() -> int:
         test_probe()
         test_needs_transcode()
         test_safe_title()
+        test_partial_wait(tmp)
         processed = test_process_file(tmp)
         test_organize(processed, tmp)
     except Exception as e:

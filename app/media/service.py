@@ -1061,6 +1061,9 @@ def _maybe_prune_batch_dir(save_path: str | Path) -> None:
 # isn't permanently stranded.
 _PP_MAX_RETRY = 20
 _PP_RETRY_DELAY = 120  # seconds between straggler-import retries (~40 min total)
+# nothing whole on disk yet (every file still '.part'): re-check a few times, then fail
+_PP_EMPTY_MAX_RETRY = 5
+_PP_SINGLE_RETRY_DELAY = 60  # a single episode is one file — re-check sooner
 
 
 def _imported_episode_set(anilist_id: int, wanted: Optional[set] = None) -> set:
@@ -1110,8 +1113,8 @@ def _postprocess_batch(download_id: Optional[int], save_path: str, anilist_id: i
             title_romaji = t["romaji"] or t["english"]
             total = t["total_episodes"]
             try:
-                from ..acquire.service import _title_season_ordinal
-                target_season = _title_season_ordinal(t["romaji"] or t["english"])
+                from ..acquire.service import title_season_ordinal
+                target_season = title_season_ordinal(t["romaji"], t["english"])
             except Exception:
                 target_season = 1
         if d and d["wanted_eps"]:
@@ -1125,8 +1128,39 @@ def _postprocess_batch(download_id: Optional[int], save_path: str, anilist_id: i
     videos = _list_video_files(save_path)
     summary["files_found"] = len(videos)
     if not videos:
+        # Nothing whole yet — a torrent can read complete while its files are
+        # still 'name.part' (Transmission renames each only when every byte is in;
+        # the endgame's last pieces can take minutes). Wait and re-check; if
+        # nothing is even in progress, or the retries run out, fail VISIBLY —
+        # this used to return quietly and the pack was never imported.
+        if download_id is not None and _has_partial_files(save_path) and pp_attempt < _PP_EMPTY_MAX_RETRY:
+            try:
+                from ..jobs.service import enqueue
+                enqueue("postprocess", {"download_id": download_id, "pp_attempt": pp_attempt + 1},
+                        delay_seconds=_PP_RETRY_DELAY)
+            except Exception as e:
+                log.warning("batch: could not re-enqueue postprocess for %s: %s", download_id, e)
+            log.info("batch %s: no finished video under %s yet — retry %d/%d in %ds",
+                     download_id, save_path, pp_attempt + 1, _PP_EMPTY_MAX_RETRY, _PP_RETRY_DELAY)
+            summary.update(ok=True, waiting=True, retry=pp_attempt + 1)
+            return summary
         summary["error"] = f"no video files under {save_path}"
         log.warning("postprocess_batch: %s", summary["error"])
+        if download_id is not None:
+            try:
+                from ..db import cursor
+                with cursor() as cx:
+                    cx.execute(
+                        "UPDATE downloads SET state='pp_failed', updated_at=datetime('now') WHERE id=?",
+                        (download_id,),
+                    )
+            except Exception as e:
+                log.warning("batch: could not mark %s pp_failed: %s", download_id, e)
+        _record_event(
+            "download", "Season pack: nothing to import", "warning",
+            detail=f"{title_romaji or anilist_id} — no finished video file under the pack folder",
+            meta={"download_id": download_id, "anilist_id": anilist_id, "kind": "batch"},
+        )
         return summary
 
     # progress is cumulative across straggler-retries: total = wanted count,
@@ -1211,6 +1245,44 @@ def _postprocess_batch(download_id: Optional[int], save_path: str, anilist_id: i
     return summary
 
 
+def _has_partial_files(path: str | Path) -> bool:
+    """True when Transmission is still writing here: the path itself is a
+    'name.part' in progress, or the folder holds one."""
+    try:
+        p = Path(path)
+        if Path(str(p) + ".part").exists():
+            return True
+        if p.is_dir():
+            return any(f.is_file() and f.name.lower().endswith(".part") for f in p.rglob("*"))
+    except Exception as e:  # pragma: no cover
+        log.debug("partial-file check failed for %s: %s", path, e)
+    return False
+
+
+def _other_rows_needing_source(download_id: Optional[int], qbt_hash: Optional[str],
+                               source: Optional[Path]) -> list[int]:
+    """Other download rows whose import still needs this source file: same
+    torrent, or the same save_path. Never raises."""
+    if download_id is None:
+        return []
+    try:
+        from ..acquire.service import other_rows_needing_torrent
+        ids = set(other_rows_needing_torrent(qbt_hash, download_id))
+        if source is not None:
+            from ..db import cursor
+            with cursor() as cx:
+                rows = cx.execute(
+                    "SELECT id FROM downloads WHERE id<>? AND save_path=? "
+                    "AND state IN ('queued','downloading','completed','pp_failed')",
+                    (download_id, str(source)),
+                ).fetchall()
+            ids.update(r["id"] for r in rows)
+        return sorted(ids)
+    except Exception as e:  # pragma: no cover
+        log.debug("shared-source check failed for %s: %s", download_id, e)
+        return []
+
+
 def _pp_error(download_id, msg: str) -> None:
     """Mark the download row failed (so the UI shows it) and RAISE.
 
@@ -1251,12 +1323,14 @@ def postprocess(payload: dict) -> dict:
     save_path = raw_path
     dl_kind = "single"
     dl_anilist = None
+    dl_hash = None
     if download_id is not None and not save_path:
         try:
             from ..db import cursor
             with cursor() as cx:
                 row = cx.execute(
-                    "SELECT save_path, title_guess, kind, anilist_id FROM downloads WHERE id=?",
+                    "SELECT save_path, title_guess, kind, anilist_id, qbt_hash "
+                    "FROM downloads WHERE id=?",
                     (download_id,),
                 ).fetchone()
             if row:
@@ -1264,19 +1338,35 @@ def postprocess(payload: dict) -> dict:
                 summary["title_guess"] = row["title_guess"]
                 dl_kind = (row["kind"] if "kind" in row.keys() else None) or "single"
                 dl_anilist = row["anilist_id"] if "anilist_id" in row.keys() else None
+                dl_hash = row["qbt_hash"] if "qbt_hash" in row.keys() else None
         except Exception as e:
             log.warning("could not read download %s: %s", download_id, e)
 
     if not save_path:
         _pp_error(download_id, "postprocess: no path / save_path to process")
 
+    pp_attempt = int(payload.get("pp_attempt", 0) or 0)
+
     # batch / season pack -> import every video file into the title (own pipeline)
     if dl_kind == "batch" and dl_anilist is not None:
-        return _postprocess_batch(download_id, save_path, dl_anilist,
-                                  int(payload.get("pp_attempt", 0) or 0))
+        return _postprocess_batch(download_id, save_path, dl_anilist, pp_attempt)
 
     video = _pick_video_file(save_path)
     if video is None:
+        # Not whole yet? Transmission writes an in-progress file as 'name.part'
+        # and renames it only when every byte is in; a torrent can read complete
+        # a beat before that. Wait and re-check instead of failing the download.
+        if download_id is not None and _has_partial_files(save_path) and pp_attempt < _PP_EMPTY_MAX_RETRY:
+            try:
+                from ..jobs.service import enqueue
+                enqueue("postprocess", {"download_id": download_id, "pp_attempt": pp_attempt + 1},
+                        delay_seconds=_PP_SINGLE_RETRY_DELAY)
+            except Exception as e:
+                log.warning("postprocess %s: could not re-enqueue: %s", download_id, e)
+            log.info("postprocess %s: file still downloading (.part) — retry %d/%d in %ds",
+                     download_id, pp_attempt + 1, _PP_EMPTY_MAX_RETRY, _PP_SINGLE_RETRY_DELAY)
+            summary.update(ok=True, waiting=True, retry=pp_attempt + 1)
+            return summary
         _pp_error(download_id, f"postprocess: no video file under {save_path}")
 
     parse_name = video.name
@@ -1398,7 +1488,13 @@ def postprocess(payload: dict) -> dict:
     extract_embedded_english(video, final_path)
 
     # 5c. prune the original source file if configured (inbox only — never Library)
-    _maybe_prune_original(video, final_path)
+    # — unless another download row still relies on this very file (the same
+    # release added twice: its import is queued behind ours on the same source).
+    others = _other_rows_needing_source(download_id, dl_hash, video)
+    if others:
+        log.info("postprocess %s: source kept — download %s still needs it", download_id, others[0])
+    else:
+        _maybe_prune_original(video, final_path)
 
     # 6. upsert episode (lazy catalog), then link the download
     episode_id = _upsert_episode(anilist_id, ep_number or 1, final_path, info)

@@ -22,21 +22,9 @@ def sweet_spot(lo: float = 80.0, hi: float = 95.0, limit: int = 60, include_watc
     return service.sweet_spot(lo=lo, hi=hi, limit=limit, include_watched=include_watched)
 
 
-class AnkiExportRequest(BaseModel):
-    line_ids: list[int]
-
-
-@router.post("/anki/export")
-def anki_export(req: AnkiExportRequest):
-    """Return a tab-separated Anki import (sentence/reading/translation/source) for
-    the given Moments lines — the sentence bank built from your own library."""
-    from fastapi.responses import PlainTextResponse
-    tsv = service.anki_export(req.line_ids)
-    return PlainTextResponse(
-        tsv,
-        media_type="text/tab-separated-values",
-        headers={"content-disposition": 'attachment; filename="mimi-lab-anki.tsv"'},
-    )
+# The Anki export (TSV + .apkg) is retired — study happens in Mimi Lab's own SRS
+# (`/api/srs/*`, SRS_DESIGN §7). Both routes, their request model and `genanki`
+# are gone; a POST to the old paths is now a plain 404.
 
 
 @router.get("/health/migaku")
@@ -135,25 +123,6 @@ def transcript(episode_id: int):
         return service.episode_transcript(episode_id)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
-
-
-@router.post("/anki/export.apkg")
-def anki_export_apkg(req: AnkiExportRequest, deck: str = Query("Mimi Lab")):
-    """A real Anki deck (.apkg) for the given lines — sentence, furigana,
-    translation, source, plus the audio/screenshot clip where video exists."""
-    import os
-    from fastapi.responses import FileResponse
-    from starlette.background import BackgroundTask
-
-    path = service.anki_export_apkg(req.line_ids, deck_name=deck)
-    if not path:
-        raise HTTPException(status_code=404, detail="no exportable lines")
-    return FileResponse(
-        path,
-        media_type="application/octet-stream",
-        filename="mimi-lab.apkg",
-        background=BackgroundTask(lambda: os.unlink(path)),
-    )
 
 
 @router.get("/stats")

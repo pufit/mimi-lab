@@ -31,12 +31,18 @@ export function LineChart({
   color = "var(--color-brand-bright)",
   yFmt = fmtNum,
   xFmt = (x: number) => new Date(x).toLocaleDateString(),
+  yMin,
   className,
 }: {
   points: ChartPoint[];
   color?: string;
   yFmt?: (y: number) => string;
   xFmt?: (x: number) => string;
+  /**
+   * Hard floor for the y axis. Counts pass 0 so the symmetric padding below the
+   * minimum cannot label the axis with an impossible negative value.
+   */
+  yMin?: number;
   className?: string;
 }) {
   if (points.length === 0) {
@@ -49,7 +55,9 @@ export function LineChart({
 
   const xs = points.map((p) => p.x);
   const ys = points.map((p) => p.y);
-  const [yLo, yHi] = niceRange(Math.min(...ys), Math.max(...ys));
+  const raw = niceRange(Math.min(...ys), Math.max(...ys));
+  const yLo = yMin === undefined ? raw[0] : Math.max(yMin, raw[0]);
+  const yHi = yLo === raw[1] ? raw[1] + 1 : raw[1];
   const xLo = Math.min(...xs);
   const xHi = Math.max(...xs);
   const xSpan = xHi - xLo || 1;

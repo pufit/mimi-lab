@@ -119,18 +119,121 @@ ruby rt {
   animation: shimmer 1.6s infinite;
 }
 
-@keyframes fade-in {
-  from {
-    opacity: 0;
-    transform: translateY(6px);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0);
-  }
+/* Motion (design §8.10).
+   Every keyframed transition lives inside `prefers-reduced-motion:
+   no-preference`. With reduced motion the card swap is instant: `.card-enter`
+   simply has no animation, and `.card-exit` (the outgoing ghost the review page
+   overlays for 180 ms) is transparent from the start, so nothing moves. */
+
+.card-enter {
+  /* no motion by default — see the media query below */
 }
-.animate-fade-in {
-  animation: fade-in 0.35s ease both;
+.card-exit {
+  opacity: 0;
+}
+.rating-flash {
+  /* no motion by default — see the media query below */
+}
+
+/* The answer panel of a review card is mounted blurred and un-blurs on the
+   reveal (`blur-*` is toggled by the component). With reduced motion the blur
+   simply switches off — the *hiding* is not motion and always applies. */
+.answer-veil {
+  will-change: filter;
+}
+
+/* Clip navigation: the sentence that is playing carries three bars in its
+   gutter. Without motion they sit at a fixed height — still a mark, just still. */
+.eq-bar {
+  transform-origin: 50% 100%;
+  transform: scaleY(0.55);
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  @keyframes eq-bar {
+    0%,
+    100% {
+      transform: scaleY(0.3);
+    }
+    50% {
+      transform: scaleY(1);
+    }
+  }
+  .eq-bar {
+    animation: eq-bar 0.8s ease-in-out infinite;
+  }
+  .eq-bar:nth-child(2) {
+    animation-delay: -0.27s;
+  }
+  .eq-bar:nth-child(3) {
+    animation-delay: -0.53s;
+  }
+
+  @keyframes fade-in {
+    from {
+      opacity: 0;
+      transform: translateY(6px);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+  .animate-fade-in {
+    animation: fade-in 0.35s ease both;
+  }
+
+  /* Review session: the answered card fades up and out, the next one fades in. */
+  @keyframes card-enter {
+    from {
+      opacity: 0;
+      transform: translateY(10px);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+  @keyframes card-exit {
+    from {
+      opacity: 1;
+      transform: translateY(0);
+    }
+    to {
+      opacity: 0;
+      transform: translateY(-24px);
+    }
+  }
+  .card-enter {
+    animation: card-enter 0.18s ease both;
+  }
+  .card-exit {
+    animation: card-exit 0.18s ease both;
+  }
+
+  /* The rated button acknowledges the keypress. */
+  @keyframes rating-flash {
+    0% {
+      filter: brightness(1);
+      transform: scale(1);
+    }
+    35% {
+      filter: brightness(1.6);
+      transform: scale(1.04);
+    }
+    100% {
+      filter: brightness(1);
+      transform: scale(1);
+    }
+  }
+  .rating-flash {
+    animation: rating-flash 0.18s ease;
+  }
+
+  /* Reveal: the answer sharpens rather than popping into focus. */
+  .answer-veil {
+    transition: filter 0.22s ease;
+  }
 }
 
 .text-balance {

@@ -81,6 +81,15 @@ class Settings(BaseSettings):
 
     # pipeline automation
     prune_originals: bool = True
+    # pipeline_periodics: register the acquisition/media/MAL/maintenance periodics
+    # (download polling, RSS, late-subtitle sweep, nightly MAL push, backups,
+    # retention). Always True for the real deployment. Set PIPELINE_PERIODICS=0 on
+    # a second instance running against a COPY of the database (MIMI_LAB_DB=…): a
+    # copy carries the live job queue, so a dev instance would otherwise re-run
+    # postprocess/transcode jobs against the real library and push to MAL. The SRS
+    # periodics (§9.2) stay registered either way — they only touch srs_* tables
+    # and the configured CLIPS_DIR.
+    pipeline_periodics: bool = True
 
     # job queue: number of concurrent worker threads. >1 stops a long transcode
     # from head-of-line-blocking interactive work (comprehension, subtitle fetch);

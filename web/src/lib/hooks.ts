@@ -7,7 +7,7 @@ import {
   useQueryClient,
 } from "@tanstack/react-query";
 import type { InfiniteData } from "@tanstack/react-query";
-import { api, ApiError, exportApkg } from "./api";
+import { api, ApiError } from "./api";
 import { toast } from "@/components/ui/toast";
 import type { Moment, MomentSort, ReleaseOption } from "./types";
 
@@ -492,42 +492,6 @@ export const useSweetSpot = (lo = 80, hi = 95, limit = 60, includeWatched = fals
     queryFn: () => api.sweetSpot(lo, hi, limit, includeWatched),
   });
 
-// ── Anki export: fetch the TSV and trigger a browser download ──
-export function useAnkiExport() {
-  return useMutation({
-    mutationFn: (lineIds: number[]) => api.ankiExport(lineIds),
-    onSuccess: (tsv) => {
-      const blob = new Blob([tsv], { type: "text/tab-separated-values" });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = "mimi-lab-anki.tsv";
-      a.click();
-      URL.revokeObjectURL(url);
-      toast.success("Anki export ready", "Import the .tsv in Anki (Notes in Plain Text)");
-    },
-    onError: (e) => toast.error("Export failed", errMsg(e)),
-  });
-}
-
-// ── Anki .apkg export (binary deck download) ───────────────
-export function useApkgExport() {
-  return useMutation({
-    mutationFn: ({ lineIds, deck }: { lineIds: number[]; deck?: string }) =>
-      exportApkg(lineIds, deck),
-    onMutate: ({ lineIds }) =>
-      toast.loading("Building Anki deck…", `${lineIds.length} card(s) with media`),
-    onSuccess: (_d, _v, tid) =>
-      toast.update(tid, {
-        title: "Deck downloaded",
-        description: "Double-click the .apkg to import it into Anki",
-        variant: "success",
-      }),
-    onError: (e, _v, tid) =>
-      toast.update(tid, { title: "Export failed", description: errMsg(e), variant: "error" }),
-  });
-}
-
 // ── One-click Follow for a title (RSS auto-download) ───────
 export function useFollowTitle() {
   const qc = useQueryClient();
@@ -934,6 +898,27 @@ export function useServerEvents() {
 
       const job = msg.job;
       const cat = msg.category;
+
+      // SRS. `["srs"]` is a PREFIX match, so it must exclude the review queue
+      // (imperative: nothing mounts it, and a refetch would inject/reorder
+      // cards under the session reducer) and, while a stack move is in flight,
+      // the card lists (an invalidation mid-drag snaps the row back under the
+      // cursor). ~1,000 `srs_clip` completions land after the initial import.
+      if (
+        msg.type === "srs" ||
+        cat === "srs" ||
+        (typeof job === "string" && job.startsWith("srs_"))
+      ) {
+        const moving = qc.isMutating({ mutationKey: ["srs", "move"] }) > 0;
+        qc.invalidateQueries({
+          queryKey: ["srs"],
+          predicate: (q) =>
+            q.queryKey[1] !== "queue" && !(moving && q.queryKey[1] === "cards"),
+        });
+        inval([qk.leverage]);
+        return;
+      }
+
       if (job === "comprehension" || cat === "comprehension") {
         inval([qk.titles, ["episodes"], ["comprehension"]]);
       }

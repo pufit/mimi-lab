@@ -382,7 +382,7 @@ def _cue_starts(path: Path) -> list[int]:
 # ANTI-correlated with correctness — a perfectly-timed JA sub scores ~0.05
 # (>90% of ref onsets are karaoke frames with no dialogue counterpart) while a
 # sub shoved onto an OP/ED storm scores ~0.30 — so aligners "win" by piling
-# dialogue cues onto karaoke clusters. (Re:Zero S3E01, 2026-07-21: a correct
+# dialogue cues onto karaoke clusters. (Re:Example S3E01, 2026-07-21: a correct
 # jimaku sub was progressively mangled across re-align passes while the score
 # "improved" 0.30 -> 0.57.)
 #
@@ -421,7 +421,7 @@ def _dialogue_events(path: Path) -> list[tuple[int, int, str]]:
         frames, glyph storms). Seconds dense in dropped junk mark typeset
         zones; survivors starting there are lyrics, not dialogue. Without this,
         a cut difference around an OP gets "corrected" by alass onto the lyric
-        anchors — dialogue rolling during the opening (Re:Zero S3E02).
+        anchors — dialogue rolling during the opening (Re:Example S3E02).
     """
     try:
         subs = _load_subs(path)
@@ -1131,10 +1131,14 @@ def _sub_dest(ep: dict) -> Path:
 
 
 # How many ranked candidates to try aligning before settling for the top pick.
-# alass fixes most timing, so this rarely goes past the first; the cap just
-# bounds the cost (alass re-extracts the video's audio per attempt) when a
-# title's leading candidates happen to be unalignable.
-_MAX_ALIGN_CANDIDATES = 3
+# The cap bounds the cost (alass re-extracts the video's audio per attempt), but
+# it has to reach the candidates that actually verify: `rank_files` carries no
+# signal for caption provenance, and streaming CCs (Amazon/ABEMA/DMMTV/Netflix
+# `[cc]`/`[sdh]`) rank 3rd–5th behind broadcast captions (CTV/AT-X) on the
+# extension + filename tiebreaks — yet against a WEB-DL video they were the only
+# tracks that aligned well (Slime S4 E07/E16/E19, 2026-09: onset 0.88–0.93 vs
+# 0.74–0.83 for the broadcast captions that ranked above them).
+_MAX_ALIGN_CANDIDATES = 5
 
 
 def _release_hint(ep: dict) -> str:
@@ -1271,20 +1275,31 @@ def sub_display_sane(sub_path: str | Path, video_path: Optional[str | Path]
 
 
 def _reference_sub_for(ep: dict) -> Optional[Path]:
-    """A trusted, video-timed English sidecar to align + score the JA study sub
+    """A trusted, video-timed English track to align + score the JA study sub
     against — the embedded softsub (muxed into the release, frame-accurate by
     construction) or an AnimeTosho official track. NOT machine translation (it's
-    derived from JA timing, so it can't verify JA). Returns <base>.en.srt or None.
+    derived from JA timing, so it can't verify JA). Returns a path or None.
 
-    On the first pass there's no EN `subtitles` row yet, but the embedded sidecar
-    is already on disk (media post-process extracts it *before* the JA fetch is
-    enqueued), so a missing row is treated as the trusted embedded case."""
+    Two places can hold it, tried in order:
+
+      1. the SERVED sidecar `<base>.en.srt` — skipped when the latest EN row says
+         it is MT output (the english resolver writes MT to that same path);
+      2. the embedded-extraction ARTIFACT (`media.service.embedded_sub_artifact`).
+         Post-process extracts there, and the artifact is only promoted onto the
+         served path by the `english_subtitle_fetch` job — which is chained AFTER
+         the JA `subtitle_fetch`. So on a fresh download the served file does not
+         exist yet while the JA candidates are being scored; without this
+         fallback, selection silently ran UNVERIFIED (VAD-only pick among
+         indistinguishable 0.67–0.75 scores) and alass→video pre-mangled the JA
+         before alass-en ever saw a reference (Slime S4 E07, 2026-08-30: onset
+         0.46 served vs 0.88 for the same candidate set scored against EN).
+
+    Whichever is found must still pass the display-sanity gate and the
+    dialogue-count floor — provenance alone is never trusted."""
     vp = ep.get("video_path")
     if not vp:
         return None
-    en = Path(vp).with_suffix("").with_suffix(".en.srt")
-    if not (en.exists() and en.stat().st_size > 0):
-        return None
+    served = Path(vp).with_suffix("").with_suffix(".en.srt")
     try:
         with connect() as cx:
             row = cx.execute(
@@ -1293,30 +1308,121 @@ def _reference_sub_for(ep: dict) -> Optional[Path]:
             ).fetchone()
     except Exception:
         row = None
-    if row and (row["source"] or "") == "mt":
-        return None  # machine translation is not ground truth for JA timing
+    candidates: list[Path] = []
+    if not (row and (row["source"] or "") == "mt"):
+        candidates.append(served)  # MT is not ground truth for JA timing
+    try:
+        from ..media.service import embedded_sub_artifact
+        candidates.append(embedded_sub_artifact(vp))
+    except Exception:  # pragma: no cover — defensive cross-module import
+        pass
 
-    # Trust the reference only if it passes the full display-sanity gate: it must
-    # fit THIS video's runtime AND not be self-overlapping. A mismatched / corrupt
-    # sidecar (wrong episode, double-length concat, bad framerate) OR a doubled
-    # track (original + shifted copy of the same dialogue) would otherwise become
-    # a false "ground truth" and drag a good JA sub out of sync — ignore it and
-    # fall back to video-audio alignment. This catches both an overlong reference
-    # and an in-range reference containing every line twice.
-    ok, why = sub_display_sane(en, vp)
-    if not ok:
-        log.info("align: EN reference for ep %s untrusted (%s) — ignoring",
-                 ep.get("id"), why)
+    for en in candidates:
+        if not (en.exists() and en.stat().st_size > 0):
+            continue
+        # Trust the reference only if it passes the full display-sanity gate: it
+        # must fit THIS video's runtime AND not be self-overlapping. A mismatched
+        # / corrupt sidecar (wrong episode, double-length concat, bad framerate)
+        # OR a doubled track (original + shifted copy of the same dialogue) would
+        # otherwise become a false "ground truth" and drag a good JA sub out of
+        # sync — ignore it and fall back to video-audio alignment. This catches
+        # both an overlong reference and an in-range reference containing every
+        # line twice.
+        ok, why = sub_display_sane(en, vp)
+        if not ok:
+            log.info("align: EN reference %s for ep %s untrusted (%s) — ignoring",
+                     en.name, ep.get("id"), why)
+            continue
+        # A track that is nearly all typesetting/karaoke (reference hygiene
+        # block) has too few dialogue-like cues left to anchor an episode — not a
+        # usable ground truth, even though it displays fine.
+        n_dialogue = len(_dialogue_events(en))
+        if n_dialogue < _REF_MIN_DIALOGUE_CUES:
+            log.info("align: EN reference %s for ep %s untrusted (only %d "
+                     "dialogue-like cues after hygiene filtering) — ignoring",
+                     en.name, ep.get("id"), n_dialogue)
+            continue
+        return en
+    return None
+
+
+_SXXEXX_RE = re.compile(r"\bS(\d{1,2})[ ._-]?E(\d{1,4})\b", re.I)
+
+
+def _parsed_episode_number(name: str) -> Optional[int]:
+    """The episode number as WRITTEN in a subtitle filename — season-relative or
+    absolute, the caller folds it. anitopy first; an SxxExx regex when anitopy
+    can't tokenize the name (episode token glued to a title, CJK-titled uploads
+    — same fallback media._parse_filename uses). None when neither can."""
+    epn = None
+    try:
+        import anitopy
+        epn = (anitopy.parse(name) or {}).get("episode_number")
+    except Exception:  # anitopy crashes on some odd filenames — fall through
+        epn = None
+    if isinstance(epn, list):
+        epn = epn[0] if epn else None
+    if epn is None:
+        m = _SXXEXX_RE.search(name or "")
+        if m:
+            epn = m.group(2)
+    try:
+        return int(str(epn).strip()) if epn is not None else None
+    except (TypeError, ValueError):
         return None
-    # A track that is nearly all typesetting/karaoke (reference hygiene block)
-    # has too few dialogue-like cues left to anchor an episode — not a usable
-    # ground truth, even though it displays fine.
-    n_dialogue = len(_dialogue_events(en))
-    if n_dialogue < _REF_MIN_DIALOGUE_CUES:
-        log.info("align: EN reference for ep %s untrusted (only %d dialogue-like "
-                 "cues after hygiene filtering) — ignoring", ep.get("id"), n_dialogue)
-        return None
-    return en
+
+
+def _bucket_files_by_episode(anilist_id: int, files: list[dict]
+                             ) -> tuple[dict[int, list[dict]], Optional[int], int]:
+    """Group one jimaku entry's files by SEASON-RELATIVE episode number.
+
+    Parses every filename ONCE, then infers the entry's absolute→relative offset
+    from the whole number set before bucketing. A single jimaku entry routinely
+    carries both conventions for the same episodes (`S02E01..E03` from one group,
+    `S02E13..E19` from another, and groups that switch mid-season), which
+    per-file logic cannot separate — the set can (match.infer_episode_offset). A
+    learned offset is persisted on the title so single-file paths fold the same
+    way. Shared by the whole-title import and the per-episode fetch so both see
+    the SAME candidate set for an episode.
+
+    Returns (files_by_relative_episode, inferred_offset, n_skipped_out_of_range).
+    """
+    from ..match import service as match_service
+
+    with connect() as cx:
+        trow = cx.execute(
+            "SELECT total_episodes FROM titles WHERE anilist_id=?", (anilist_id,)
+        ).fetchone()
+    total_eps = (trow["total_episodes"] if trow else None) or None
+
+    parsed_eps: list[tuple[dict, Optional[int]]] = [
+        (f, _parsed_episode_number(_file_name(f))) for f in files
+    ]
+    ceiling = match_service.episode_ceiling(anilist_id, total_eps)
+    offset = match_service.infer_episode_offset(
+        (epn for _, epn in parsed_eps), ceiling
+    )
+    if offset:
+        if offset != match_service.stored_episode_offset(anilist_id):
+            log.info(
+                "title %s: absolute episode numbering detected (offset %d, %d aired) "
+                "— folding to season-relative",
+                anilist_id, offset, ceiling,
+            )
+        match_service.set_episode_offset(anilist_id, offset)
+
+    by_ep: dict[int, list[dict]] = {}
+    skipped = 0
+    for f, epn in parsed_eps:
+        rel = match_service.normalize_episode_number(
+            anilist_id, epn, total_eps, offset_hint=offset
+        )
+        if rel is None:
+            if epn is not None:
+                skipped += 1
+            continue
+        by_ep.setdefault(rel, []).append(f)
+    return by_ep, offset, skipped
 
 
 def fetch_for_episode(episode_id: int) -> dict:
@@ -1334,18 +1440,38 @@ def fetch_for_episode(episode_id: int) -> dict:
     if not entries:
         return {"episode_id": episode_id, "status": "no_entries", "anilist_id": anilist_id}
 
-    # try entries in order until one yields files for this episode
+    # Try entries in order until one yields files for this episode.
+    #
+    # Pull each entry's WHOLE file list and bucket it by season-relative episode
+    # ourselves (the same folding fetch_for_title does) rather than trusting
+    # jimaku's `?episode=N` filter: that filter only matches files numbered like
+    # N, so a sequel's absolute-numbered uploads — `- 88` / `S04E88` for S4E16 —
+    # were invisible to per-episode fetches even while the title already carried
+    # `episode_offset=72`. For Slime S4 that hid every streaming-CC upload
+    # (ABEMA/DMMTV/Netflix) and left only broadcast captions to choose from
+    # (E16/E19, 2026-09-02). The filtered call stays as a fallback for names our
+    # parser can't place at all.
     chosen_entry = None
     files: list[dict] = []
     for entry in entries:
         eid = entry.get("id")
         if eid is None:
             continue
+        fs: list[dict] = []
         try:
-            fs = jimaku_files(eid, ep_number)
+            all_files = jimaku_files(eid)
         except Exception as e:
-            log.warning("jimaku_files(%s,%s) failed: %s", eid, ep_number, e)
-            continue
+            log.warning("jimaku_files(%s) failed: %s", eid, e)
+            all_files = []
+        if all_files:
+            by_ep, _offset, _skipped = _bucket_files_by_episode(anilist_id, all_files)
+            fs = by_ep.get(ep_number) or []
+        if not fs:
+            try:
+                fs = jimaku_files(eid, ep_number)
+            except Exception as e:
+                log.warning("jimaku_files(%s,%s) failed: %s", eid, ep_number, e)
+                continue
         if fs:
             chosen_entry = entry
             files = fs
@@ -1457,8 +1583,6 @@ def fetch_for_title(anilist_id: int) -> dict:
     one search + one files call for the whole entry, then download/ingest each
     episode's sub (skipping episodes already ingested). Far fewer jimaku API
     calls than per-episode fetching."""
-    import anitopy
-
     from ..catalog import service as catalog
 
     # Airing progress + episode count decide relative-vs-absolute numbering
@@ -1489,64 +1613,17 @@ def fetch_for_title(anilist_id: int) -> dict:
     if not files:
         return {"anilist_id": anilist_id, "status": "no_files", "episodes": 0}
 
-    # episode count for this title — used to normalize absolute (cross-season)
-    # numbering back to season-relative and to drop out-of-range files (otherwise
-    # a sequel's absolute-numbered subs inflate the episode list; see
-    # match.normalize_episode_number).
-    from ..match import service as match_service
-
-    with connect() as cx:
-        trow = cx.execute(
-            "SELECT total_episodes FROM titles WHERE anilist_id=?", (anilist_id,)
-        ).fetchone()
-    total_eps = (trow["total_episodes"] if trow else None) or None
-
-    # parse every filename ONCE, then infer this entry's absolute→relative
-    # offset from the whole number set before bucketing. A single jimaku entry
-    # routinely carries both conventions for the same episodes (`S02E01..E03`
-    # from one group, `S02E13..E19` from another, and groups that switch
-    # mid-season), which per-file logic cannot separate — the set can.
-    parsed_eps: list[tuple[dict, Optional[int]]] = []
-    for f in files:
-        try:
-            p = anitopy.parse(_file_name(f)) or {}
-        except Exception:  # anitopy crashes on some odd filenames — skip cleanly
-            p = {}
-        epn = p.get("episode_number")
-        if isinstance(epn, list):
-            epn = epn[0] if epn else None
-        parsed_eps.append((f, epn))
-
-    ceiling = match_service.episode_ceiling(anilist_id, total_eps)
-    offset = match_service.infer_episode_offset(
-        (epn for _, epn in parsed_eps), ceiling
-    )
-    if offset:
-        log.info(
-            "title %s: absolute episode numbering detected (offset %d, %d aired) "
-            "— folding to season-relative",
-            anilist_id, offset, ceiling,
-        )
-        match_service.set_episode_offset(anilist_id, offset)
-
-    # group subtitle files by SEASON-RELATIVE episode number (parsed + normalized)
-    by_ep: dict[int, list] = {}
-    skipped_out_of_range = 0
-    for f, epn in parsed_eps:
-        rel = match_service.normalize_episode_number(
-            anilist_id, epn, total_eps, offset_hint=offset
-        )
-        if rel is None:
-            if epn is not None:
-                skipped_out_of_range += 1
-            continue
-        by_ep.setdefault(rel, []).append(f)
+    # group subtitle files by SEASON-RELATIVE episode number — absolute
+    # (cross-season) numbering folded onto relative, out-of-range files dropped
+    # (otherwise a sequel's absolute-numbered subs inflate the episode list).
+    # Shared with fetch_for_episode so both paths see the same candidate set.
+    by_ep, _offset, skipped_out_of_range = _bucket_files_by_episode(anilist_id, files)
     if not by_ep:
         return {"anilist_id": anilist_id, "status": "no_episodic_files", "episodes": 0}
     if skipped_out_of_range:
         log.info(
-            "title %s: skipped %d subtitle file(s) outside 1..%s (absolute/extra numbering)",
-            anilist_id, skipped_out_of_range, total_eps,
+            "title %s: skipped %d subtitle file(s) outside the season (absolute/extra numbering)",
+            anilist_id, skipped_out_of_range,
         )
 
     # episodes already ingested -> skip (idempotent + saves downloads)

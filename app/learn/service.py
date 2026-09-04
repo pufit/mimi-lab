@@ -20,7 +20,6 @@ import json
 import math
 import re
 import subprocess
-import tempfile
 import time
 from functools import lru_cache
 from pathlib import Path
@@ -314,7 +313,34 @@ def _known_lookup() -> tuple[set[str], set[str]]:
                 known.add(df)
             elif st == "IGNORED":
                 ignored.add(df)
+    # SRS overlay (SRS_DESIGN §2.6): a word the study deck considers known
+    # counts as known everywhere, and beats a stale Migaku IGNORED row. Guarded:
+    # a very old DB without the srs_* tables must keep working.
+    try:
+        from ..srs.service import known_forms as _srs_known
+
+        srs = _srs_known()
+        known |= srs
+        ignored -= srs
+    except Exception as e:
+        log.debug("srs overlay unavailable: %s", e)
     return known, ignored
+
+
+def _srs_known_predicate(alias: str = "ll") -> str:
+    """SQL fragment excluding lemmas the SRS deck counts as known (§2.6.2).
+
+    Returns `''` when the SRS package is unavailable, so every caller can
+    interpolate it unconditionally.
+    """
+    try:
+        from ..srs.service import KNOWN_SQL
+
+        return (f" AND NOT EXISTS (SELECT 1 FROM srs_cards sc "
+                f"WHERE sc.lemma = {alias}.lemma AND {KNOWN_SQL})")
+    except Exception as e:
+        log.debug("srs known predicate unavailable: %s", e)
+        return ""
 
 
 def _token_status(lemma: str, surface: Optional[str], known: set[str],
@@ -707,6 +733,7 @@ def _unknown_counts(cx, line_ids: list[int]) -> dict[int, int]:
             f"WHERE ll.line_id IN ({marks}) "
             f"AND NOT EXISTS (SELECT 1 FROM known_words kw WHERE kw.dict_form = ll.lemma "
             f"                AND kw.status IN ('KNOWN','IGNORED')) "
+            f"{_srs_known_predicate('ll')} "
             f"GROUP BY ll.line_id",
             chunk,
         ).fetchall()
@@ -1227,40 +1254,6 @@ def sweet_spot(lo: float = 80.0, hi: float = 95.0, limit: int = 60,
     ]
 
 
-def anki_export(line_ids: list[int]) -> str:
-    """Build a tab-separated Anki import for the given subtitle lines.
-
-    Columns: Sentence, Reading(furigana), Translation, Source (Title · Ep). Import
-    into Anki as TSV (Notes in Plain Text); the sentence-mining fields map 1:1.
-    Sentences the user built from their OWN library — the Moments sentence bank.
-    """
-    if not line_ids:
-        return ""
-    q = ",".join("?" * len(line_ids))
-    with connect() as cx:
-        rows = cx.execute(
-            f"SELECT sl.id, sl.text, sl.text_furigana, sl.translation, "
-            f"       e.ep_number, t.romaji, t.english "
-            f"FROM subtitle_lines sl JOIN episodes e ON e.id = sl.episode_id "
-            f"JOIN titles t ON t.anilist_id = e.anilist_id "
-            f"WHERE sl.id IN ({q})",
-            line_ids,
-        ).fetchall()
-    order = {lid: i for i, lid in enumerate(line_ids)}
-    rows = sorted(rows, key=lambda r: order.get(r["id"], 1e9))
-
-    def esc(s) -> str:
-        return (s or "").replace("\t", " ").replace("\n", " ").strip()
-
-    out = []
-    for r in rows:
-        source = f"{r['english'] or r['romaji'] or ''} · Ep {r['ep_number']}".strip(" ·")
-        out.append("\t".join([
-            esc(r["text"]), esc(r["text_furigana"]), esc(r["translation"]), esc(source)
-        ]))
-    return "\n".join(out) + ("\n" if out else "")
-
-
 # --------------------------------------------------------------------------
 # Word leverage — "which words unlock the most content"
 # --------------------------------------------------------------------------
@@ -1309,6 +1302,7 @@ def _compute_word_leverage(lo: float = 60.0, hi: float = 80.0, top: int = 100) -
             f"            AND lf.rank <= 30000) "
             f"AND NOT EXISTS (SELECT 1 FROM known_words kw WHERE kw.dict_form = ll.lemma "
             f"                AND kw.status IN ('KNOWN','IGNORED')) "
+            f"{_srs_known_predicate('ll')} "
             f"GROUP BY ll.lemma, ll.episode_id",
             ids + list(non_vocab),
         ).fetchall()
@@ -1437,6 +1431,15 @@ def episode_transcript(episode_id: int) -> dict:
         toks = [tokenize(t) for t in texts]
 
     known, ignored = _known_lookup()
+    # words with an active SRS card are neither known nor plain unknown — the
+    # transcript colours them LEARNING (sky blue), like Migaku does (§2.6.3).
+    try:
+        from ..srs.service import active_forms as _srs_active
+
+        srs_active = _srs_active()
+    except Exception as e:
+        log.debug("srs active overlay unavailable: %s", e)
+        srs_active = set()
     out_lines = []
     for ln, line_toks in zip(lines, toks):
         tokens = []
@@ -1446,11 +1449,14 @@ def episode_transcript(episode_id: int) -> dict:
             if not _is_content(lemma, surface):
                 continue
             reading = _to_hira(t.get("reading"))
+            status = _token_status(lemma, surface, known, ignored, reading=reading)
+            if status == "UNKNOWN" and lemma in srs_active:
+                status = "LEARNING"
             tokens.append({
                 "surface": surface,
                 "dict_form": lemma,
                 "reading": reading,
-                "status": _token_status(lemma, surface, known, ignored, reading=reading),
+                "status": status,
             })
         out_lines.append({
             "line_id": ln["id"], "idx": ln["idx"],
@@ -1468,94 +1474,6 @@ def episode_transcript(episode_id: int) -> dict:
         "source": source,
         "lines": out_lines,
     }
-
-
-# --------------------------------------------------------------------------
-# .apkg Anki export (proper deck with media, replacing bare-TSV-per-line)
-# --------------------------------------------------------------------------
-_ANKI_MODEL_ID = 1607392319001
-_ANKI_DECK_ID = 2059400110001
-
-
-def anki_export_apkg(line_ids: list[int], deck_name: str = "Mimi Lab") -> Optional[str]:
-    """Build a real .apkg for the given lines: sentence + furigana + translation
-    + source, with the screenshot/audio clip bundled when the episode has video.
-    Returns the path of a temp .apkg (caller streams + deletes), or None."""
-    import genanki
-
-    if not line_ids:
-        return None
-    q = ",".join("?" * len(line_ids))
-    with connect() as cx:
-        rows = cx.execute(
-            f"SELECT sl.id, sl.text, sl.text_furigana, sl.translation, "
-            f"       e.id AS episode_id, e.ep_number, e.video_path, t.romaji, t.english "
-            f"FROM subtitle_lines sl JOIN episodes e ON e.id = sl.episode_id "
-            f"JOIN titles t ON t.anilist_id = e.anilist_id "
-            f"WHERE sl.id IN ({q})",
-            line_ids,
-        ).fetchall()
-    order = {lid: i for i, lid in enumerate(line_ids)}
-    rows = sorted(rows, key=lambda r: order.get(r["id"], 1e9))
-    if not rows:
-        return None
-
-    model = genanki.Model(
-        _ANKI_MODEL_ID,
-        "Mimi Lab Sentence",
-        fields=[{"name": f} for f in
-                ("Sentence", "Furigana", "Translation", "Source", "Audio", "Image")],
-        templates=[{
-            "name": "Sentence",
-            "qfmt": '<div class="jp">{{Sentence}}</div>{{Audio}}',
-            "afmt": '<div class="jp">{{furigana:Furigana}}</div><hr id="answer">'
-                    '<div class="en">{{Translation}}</div>{{Image}}'
-                    '<div class="src">{{Source}}</div>',
-        }],
-        css=".card{font-family:sans-serif;text-align:center;}"
-            ".jp{font-size:28px;} .en{font-size:18px;color:#555;}"
-            ".src{font-size:12px;color:#999;margin-top:8px;} img{max-width:90%;}",
-    )
-    deck = genanki.Deck(_ANKI_DECK_ID, deck_name)
-    media_files: list[str] = []
-
-    def _furigana_field(html: Optional[str], plain: str) -> str:
-        """Convert our <ruby>X<rt>y</rt></ruby> html to Anki's X[y] furigana."""
-        if not html:
-            return plain
-        s = re.sub(r"<ruby>(.*?)<rt>(.*?)</rt></ruby>", r" \1[\2]", html)
-        return re.sub(r"<[^>]+>", "", s).strip()
-
-    for r in rows:
-        audio_field = image_field = ""
-        if r["video_path"]:
-            try:
-                clip = extract_clip(r["id"])
-                img = settings.clips_dir / f"line_{r['id']}.jpg"
-                aud = settings.clips_dir / f"line_{r['id']}.m4a"
-                if img.exists():
-                    media_files.append(str(img))
-                    image_field = f'<img src="{img.name}">'
-                if aud.exists():
-                    media_files.append(str(aud))
-                    audio_field = f"[sound:{aud.name}]"
-            except Exception as e:
-                log.debug("apkg clip for line %s skipped: %s", r["id"], e)
-        source = f"{r['english'] or r['romaji'] or ''} · Ep {r['ep_number']}".strip(" ·")
-        deck.add_note(genanki.Note(model=model, fields=[
-            r["text"] or "",
-            _furigana_field(r["text_furigana"], r["text"] or ""),
-            r["translation"] or "",
-            source,
-            audio_field,
-            image_field,
-        ]))
-
-    pkg = genanki.Package(deck)
-    pkg.media_files = media_files
-    out = Path(tempfile.mkstemp(suffix=".apkg", prefix="mimi_lab_")[1])
-    pkg.write_to_file(str(out))
-    return str(out)
 
 
 # --------------------------------------------------------------------------

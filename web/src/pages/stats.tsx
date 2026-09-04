@@ -1,11 +1,22 @@
 import { useMemo } from "react";
-import { BarChart3, BookMarked, Clapperboard, Loader2, Sparkles, TrendingUp } from "lucide-react";
+import { Link } from "react-router-dom";
+import {
+  BarChart3,
+  BookMarked,
+  ChevronRight,
+  Clapperboard,
+  GraduationCap,
+  Loader2,
+  Sparkles,
+  TrendingUp,
+} from "lucide-react";
 import { useStats } from "@/lib/hooks";
 import { PageHeader } from "@/components/layout/page-header";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
 import { EmptyState } from "@/components/ui/empty-state";
 import { ErrorState } from "@/components/ui/error-state";
 import { Skeleton } from "@/components/ui/skeleton";
+import { Button } from "@/components/ui/button";
 import { LineChart, BarChart, StackedBar } from "@/components/charts";
 import type { StatsResponse } from "@/lib/types";
 
@@ -188,6 +199,26 @@ function StatsBody({ data }: { data: StatsResponse }) {
           </CardContent>
         </Card>
       </div>
+
+      <Card>
+        <CardHeader className="flex-row items-center justify-between gap-3 pb-3">
+          <div className="flex flex-col gap-1">
+            <CardTitle className="flex items-center gap-2 text-sm">
+              <GraduationCap className="size-4 text-brand-bright" />
+              Study
+            </CardTitle>
+            <CardDescription className="text-xs">
+              Retention, review load and the due forecast for your own deck.
+            </CardDescription>
+          </div>
+          <Link to="/study/stats">
+            <Button variant="secondary" size="sm">
+              Study stats
+              <ChevronRight className="size-3.5" />
+            </Button>
+          </Link>
+        </CardHeader>
+      </Card>
 
       <Card>
         <CardHeader className="pb-2">

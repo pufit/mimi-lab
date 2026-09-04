@@ -8,9 +8,8 @@ import {
   Sparkles,
   Languages,
   Scissors,
-  Download,
   ExternalLink,
-  Package,
+  GraduationCap,
   ChevronDown,
   ListOrdered,
   Pickaxe,
@@ -19,11 +18,13 @@ import {
   useMoments,
   usePlayMoment,
   useClip,
-  useAnkiExport,
-  useApkgExport,
   useTranslateLine,
   MOMENTS_PAGE,
 } from "@/lib/hooks";
+import { useQuery } from "@tanstack/react-query";
+import { useCreateCard } from "@/lib/srs-hooks";
+import { srsApi } from "@/lib/srs-api";
+import { apiErrorBody } from "@/lib/api";
 import { PageHeader } from "@/components/layout/page-header";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
@@ -35,7 +36,7 @@ import { Furigana } from "@/components/furigana";
 import { MomentPlayer } from "@/components/moment-player";
 import { toast } from "@/components/ui/toast";
 import { cn, formatMs } from "@/lib/utils";
-import type { Moment, MomentSort, ClipResult } from "@/lib/types";
+import type { Moment, MomentSort, ClipResult, SrsCreateCardConflict } from "@/lib/types";
 
 const SUGGESTIONS = ["時間", "大丈夫", "気持ち", "世界", "本当"];
 
@@ -112,12 +113,22 @@ export function MomentsPage() {
       .sort((a, b) => a.title.localeCompare(b.title));
   }, [moments, show]);
 
-  const apkg = useApkgExport();
-  const exportAll = () =>
-    apkg.mutate({
-      lineIds: moments.map((m) => m.line_id),
-      deck: `Mimi Lab - ${query}`,
-    });
+  // A single word (no spaces) is a lemma we can turn into a study card.
+  const lemma = query && !/\s/.test(query) ? query : null;
+
+  // One lookup for the whole page: if the word already has a card, every moment
+  // renders "Open card" up front instead of discovering it through a 409.
+  const deckHit = useQuery({
+    queryKey: ["srs", "lemma-card", lemma],
+    // `q` is a substring match (価値 also returns 価値観), so ask for enough rows
+    // to be sure the exact lemma is among them and then match it exactly.
+    queryFn: () => srsApi.cards({ q: lemma ?? "", state: "all", limit: 50 }),
+    enabled: !!lemma,
+    staleTime: 30_000,
+  });
+  const existingCardId = lemma
+    ? (deckHit.data?.items.find((c) => c.lemma === lemma)?.id ?? null)
+    : null;
 
   return (
     <div className="animate-fade-in">
@@ -238,18 +249,20 @@ export function MomentsPage() {
               <span className="font-jp text-brand-bright">{query}</span>
               {show && <span className="text-faint"> · {show.title}</span>}
             </p>
-            <div className="ml-auto">
-              <Button
-                variant="secondary"
-                size="sm"
-                onClick={exportAll}
-                loading={apkg.isPending}
-                title="Build an Anki deck (.apkg with screenshots + audio) from every loaded moment"
-              >
-                <Package className="size-3.5" />
-                Export all to Anki (.apkg)
-              </Button>
-            </div>
+            {lemma && (
+              <div className="ml-auto">
+                <Link to={`/study/stack?tab=upnext`}>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    title="See which words are queued to become study cards"
+                  >
+                    <GraduationCap className="size-3.5" />
+                    Study candidates
+                  </Button>
+                </Link>
+              </div>
+            )}
           </div>
 
           <div className="grid gap-4 lg:grid-cols-2">
@@ -257,6 +270,8 @@ export function MomentsPage() {
               <MomentCard
                 key={m.line_id}
                 moment={m}
+                lemma={lemma}
+                existingCardId={existingCardId}
                 showIplus1={sort === "iplus1"}
                 onOpen={() => setPlaying(m)}
               />
@@ -284,17 +299,25 @@ export function MomentsPage() {
 
 function MomentCard({
   moment,
+  lemma,
+  existingCardId,
   showIplus1,
   onOpen,
 }: {
   moment: Moment;
+  /** Non-null when the search is one word — that word can become a study card. */
+  lemma: string | null;
+  /** The card this lemma already has, resolved once for the whole page. */
+  existingCardId: number | null;
   showIplus1: boolean;
   onOpen: () => void;
 }) {
   const play = usePlayMoment();
   const clip = useClip();
-  const anki = useAnkiExport();
   const translate = useTranslateLine();
+  const create = useCreateCard();
+  const [createdCardId, setCardId] = useState<number | null>(null);
+  const cardId = createdCardId ?? existingCardId;
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const [playing, setPlaying] = useState(false);
   const [clipped, setClipped] = useState<ClipResult | null>(null);
@@ -489,19 +512,49 @@ function MomentCard({
               Make clip
             </Button>
           )}
-          <Button
-            variant="secondary"
-            size="sm"
-            onClick={(e) => {
-              e.stopPropagation();
-              anki.mutate([moment.line_id]);
-            }}
-            loading={anki.isPending}
-            title="Export this sentence to Anki (TSV)"
-          >
-            <Download className="size-3.5" />
-            Anki
-          </Button>
+          {lemma &&
+            (cardId ? (
+              <Link to={`/study/cards/${cardId}`} onClick={(e) => e.stopPropagation()}>
+                <Button variant="ghost" size="sm" title="This word is already in your deck">
+                  <GraduationCap className="size-3.5" />
+                  Open card
+                </Button>
+              </Link>
+            ) : (
+              <Button
+                variant="secondary"
+                size="sm"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  create.mutate(
+                    { lemma, line_id: moment.line_id },
+                    {
+                      onSuccess: (res) => res.card && setCardId(res.card.id),
+                      onError: (err) => {
+                        const body = apiErrorBody<SrsCreateCardConflict>(err);
+                        if (body?.card_id) {
+                          setCardId(body.card_id);
+                          toast({
+                            title: `${lemma} is already in your deck`,
+                            description: "Use Open card to go to it.",
+                          });
+                        } else {
+                          toast.error(
+                            "Couldn't add the card",
+                            err instanceof Error ? err.message : undefined,
+                          );
+                        }
+                      },
+                    },
+                  );
+                }}
+                loading={create.isPending}
+                title="Make a study card from this sentence"
+              >
+                <GraduationCap className="size-3.5" />
+                Add to Study
+              </Button>
+            ))}
         </div>
       </div>
     </article>
